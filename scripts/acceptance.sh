@@ -72,6 +72,17 @@ check AC-7-enrol 403 -X POST -H "Authorization: Bearer $TOKEN_VERIFY" -H 'Conten
 # check AC-1 200 -X POST "$BASE_URL/api/..." -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{...}'
 # assert_body AC-1 '"id":'
 
+# AC-14 / AC-17 / AC-30..33: submit and read verifications (decisions come from the matcher in step 5)
+TOKEN_B=$(./scripts/token.sh bank-beta acceptance "verify" 2>/dev/null)
+check AC-14 202 -X POST -H "Authorization: Bearer $TOKEN_VERIFY" -H 'Content-Type: application/json' -H "Idempotency-Key: acc-$SUBJ" -d "{\"subjectId\":\"$SUBJ\",\"probeTemplate\":\"$TEMPLATE\"}" "$BASE_URL/v1/verifications"
+VID=$(sed -n 's/.*"verificationId":"\([0-9a-f-]*\)".*/\1/p' <<<"$BODY")
+check AC-31 200 -H "Authorization: Bearer $TOKEN_VERIFY" "$BASE_URL/v1/verifications/$VID"
+assert_body AC-31 '"subjectId":"'"$SUBJ"'"'
+check AC-33-other-tenant 404 -H "Authorization: Bearer $TOKEN_B" "$BASE_URL/v1/verifications/$VID"
+check AC-33-not-uuid 404 -H "Authorization: Bearer $TOKEN_VERIFY" "$BASE_URL/v1/verifications/not-a-uuid"
+check AC-15-key 400 -X POST -H "Authorization: Bearer $TOKEN_VERIFY" -H 'Content-Type: application/json' -d "{\"subjectId\":\"$SUBJ\",\"probeTemplate\":\"$TEMPLATE\"}" "$BASE_URL/v1/verifications"
+check AC-17-unknown 202 -X POST -H "Authorization: Bearer $TOKEN_VERIFY" -H 'Content-Type: application/json' -H "Idempotency-Key: acc-ghost-$SUBJ" -d "{\"subjectId\":\"ghost-$SUBJ\",\"probeTemplate\":\"$TEMPLATE\"}" "$BASE_URL/v1/verifications"
+
 # --- hostile inputs (>= 3 per endpoint) ----------------------------------------
 # check HOSTILE-1 400 -X POST "$BASE_URL/api/..." -H 'Content-Type: application/json' -d '{"name":"'"$(printf 'a%.0s' {1..10000})"'"}'
 
