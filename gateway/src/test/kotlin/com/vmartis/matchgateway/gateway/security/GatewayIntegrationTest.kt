@@ -9,7 +9,6 @@ import org.springframework.test.context.DynamicPropertySource
 
 @SpringBootTest(
     webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
-    properties = ["management.server.port=0"],
 )
 @AutoConfigureRestTestClient
 @Import(TestcontainersConfiguration::class)

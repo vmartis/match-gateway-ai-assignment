@@ -2,11 +2,9 @@ package com.vmartis.matchgateway.gateway.auth.infra
 
 import jakarta.servlet.DispatcherType
 import org.springframework.boot.health.actuate.endpoint.HealthEndpoint
-import org.springframework.boot.micrometer.metrics.autoconfigure.export.prometheus.PrometheusScrapeEndpoint
 import org.springframework.boot.security.autoconfigure.actuate.web.servlet.EndpointRequest
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
-import org.springframework.http.HttpMethod
 import org.springframework.security.config.annotation.web.builders.HttpSecurity
 import org.springframework.security.config.annotation.web.invoke
 import org.springframework.security.config.http.SessionCreationPolicy
@@ -20,8 +18,7 @@ import org.springframework.web.cors.UrlBasedCorsConfigurationSource
 /**
  * Deny by default, stateless, bearer-only (CSRF off – ADR-005). Scope checks are URL rules here, so a caller without the
  * scope is rejected before the request body is read (D-18); tenant ownership is enforced in SQL by each feature.
- * Public without a token: GET /actuator/health on the API port (D-19) and, on the internal management port only,
- * health + prometheus (D-6; EndpointRequest only matches the management server while it has its own port).
+ * Public without a token: the standard actuator health endpoint and its probes (D-23).
  */
 @Configuration
 class SecurityConfig {
@@ -43,8 +40,8 @@ class SecurityConfig {
                 referrerPolicy { policy = ReferrerPolicyHeaderWriter.ReferrerPolicy.NO_REFERRER }
             }
             authorizeHttpRequests {
-                authorize(EndpointRequest.to(HealthEndpoint::class.java, PrometheusScrapeEndpoint::class.java), permitAll)
-                authorize(HttpMethod.GET, "/actuator/health", permitAll)
+                // Standard actuator health (incl. liveness/readiness groups) is public; no other endpoint is exposed (D-23).
+                authorize(EndpointRequest.to(HealthEndpoint::class.java), permitAll)
                 // Container error dispatches (e.g. 404 for an unknown path) carry no authentication in a stateless chain.
                 authorize(DispatcherTypeRequestMatcher(DispatcherType.ERROR), permitAll)
                 // Scope rules per PATH for every method: HEAD/PATCH/… cannot slip past a GET-only rule (review step 2).

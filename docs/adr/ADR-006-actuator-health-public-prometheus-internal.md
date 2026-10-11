@@ -1,6 +1,6 @@
 # ADR-006: Actuator: health public, Prometheus internal only
 
-- **Status:** Accepted (amended by D-19, 2026-10-11)
+- **Status:** Accepted, amended by D-19 and then D-23 (2026-10-11)
 - **Date:** 2026-10-11
 - **Deciders:** human (+ AI proposal, architect subagent)
 
@@ -37,3 +37,12 @@ so `server:/actuator/health` is impossible. Instead, `PublicHealthController` se
 delegating to `HealthEndpoint` and returns the aggregate status only (503 when not UP). Actuator (health + prometheus) stays on the
 management port 8081. `ManagementPortGuard` fails startup if `management.server.port` is unset or equal to `server.port`, because the
 `EndpointRequest` permit in `SecurityConfig` is only port-scoped while the management server has its own port (security review 1a).
+
+## Amendment 2 (D-23, supersedes the D-19 amendment)
+
+The delegating `PublicHealthController` was a re-implementation of a framework feature. The root cause was this ADR's own design:
+a separate management port moves *every* actuator endpoint, including health, off the API port. Now the standard actuator runs on
+the API port: exposure `health` only, `show-details`/`show-components: never`, liveness/readiness probes enabled, permitted via
+`EndpointRequest.to(HealthEndpoint)`; every other `/actuator/**` path falls into the `denyAll` fallback. `PublicHealthController`
+and `ManagementPortGuard` are removed. Consequence: port isolation for Prometheus no longer exists on the gateway – step 10 decides
+how gateway metrics are exposed (the matcher's metrics stay on its unpublished port 8081).

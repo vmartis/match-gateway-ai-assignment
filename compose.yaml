@@ -25,12 +25,23 @@ x-hardening: &hardening
   pids_limit: 512
 
 # Healthcheck without curl/wget in the image: a plain HTTP request over bash's /dev/tcp.
-x-health: &health
+x-health: &health      # matcher: actuator on its server port 8081 (not published)
   test:
     - CMD
     - bash
     - -c
     - "exec 3<>/dev/tcp/127.0.0.1/8081 && printf 'GET /actuator/health HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && grep -q '\"status\":\"UP\"' <&3"
+  interval: 3s
+  timeout: 3s
+  retries: 40
+  start_period: 10s
+
+x-health-gateway: &health-gateway      # gateway: standard actuator on the API port 8080 (D-23)
+  test:
+    - CMD
+    - bash
+    - -c
+    - "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /actuator/health HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && grep -q '\"status\":\"UP\"' <&3"
   interval: 3s
   timeout: 3s
   retries: 40
@@ -107,13 +118,13 @@ services:
       - dbcreds:/run/dbcreds:ro
       - gateway-keys:/run/keys:ro
     ports:
-      - "127.0.0.1:8080:8080" # API on localhost only (plain HTTP); management port 8081 stays internal (D-6)
+      - "127.0.0.1:8080:8080" # API + standard actuator health on localhost only (plain HTTP)
     depends_on:
       postgres:
         condition: service_healthy
       keygen:
         condition: service_completed_successfully
-    healthcheck: *health
+    healthcheck: *health-gateway
 
   matcher:
     <<: *hardening

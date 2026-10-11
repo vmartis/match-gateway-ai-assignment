@@ -34,6 +34,8 @@ assert_body() {
 check HEALTH 200 "$BASE_URL/actuator/health"
 assert_body HEALTH '"status":"UP"'
 check ACTUATOR 401 "$BASE_URL/actuator/env"   # only health is exposed; everything else denied
+check LIVENESS 200 "$BASE_URL/actuator/health/liveness"
+check READINESS 200 "$BASE_URL/actuator/health/readiness"
 
 # --- acceptance criteria (one block per AC from docs/SPEC.md) ----------------
 # Tokens come from the dev tool (AC-5); never printed.

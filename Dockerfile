@@ -24,7 +24,7 @@ ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75", "-jar", "/app/app.jar"]
 FROM runtime AS gateway
 # Root-owned and read-only for uid 10001: the app cannot rewrite its own code.
 COPY --from=build /src/gateway/build/libs/app.jar /app/app.jar
-EXPOSE 8080 8081
+EXPOSE 8080
 
 FROM runtime AS matcher
 COPY --from=build /src/matcher/build/libs/app.jar /app/app.jar

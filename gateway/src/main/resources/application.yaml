@@ -23,17 +23,21 @@ server:
     whitelabel:
       enabled: false
 
+# Standard actuator on the API port (D-23): only health is exposed; status only; liveness/readiness probes.
 management:
-  server:
-    port: 8081
   endpoints:
     web:
       exposure:
-        include: health,prometheus
+        include: health
   endpoint:
     health:
       show-details: never
       show-components: never
+      probes:
+        enabled: true
+  health:
+    probes:
+      enabled: true
 
 # Resource server (ADR-004): public key only, mounted from the keygen volume in compose.
 app:
