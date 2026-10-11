@@ -25,19 +25,23 @@
   confirm. A relay in the gateway re-publishes outbox rows older than a few seconds (lost publish, broker down, gateway crash).
   Duplicate publishes are harmless (see exactly-once).
 - **Topology** (declared by the apps, idempotent): durable direct exchange `matchgw.verifications` → quorum queue
-  `matchgw.verifications` with `x-delivery-limit=3`, `x-dead-letter-exchange=matchgw.verifications.dlx`,
-  `x-dead-letter-strategy=at-least-once`, `x-overflow=reject-publish`; dead-letter quorum queue `matchgw.verifications.dead`.
+  `matchgw.verifications` with `x-delivery-limit=2` (the limit counts *re*deliveries: 2 = at most 3 deliveries, verified on
+  RabbitMQ 4.3.6), `x-dead-letter-exchange=matchgw.verifications.dlx`, `x-dead-letter-routing-key=verification`,
+  `x-dead-letter-strategy=at-least-once`, `x-overflow=reject-publish`; dead-letter quorum queue `matchgw.verifications.dead` with
+  `x-delivery-limit=-1` (unlimited – the 4.x default of 20 would silently drop a dead letter whose handler keeps failing).
 - **Consuming:** manual acknowledgement. Per message the matcher decides and writes the outcome in one transaction with the
   guarded terminal write `UPDATE … WHERE id=? AND status='PENDING'`, then acks **after commit**. Effects (counter, latency) are
   recorded only if 1 row changed. A message for a row that is already terminal (duplicate, redelivery, erased) is acked without
   effect. `SUBJECT_NOT_ENROLLED` is terminal on the first delivery. On a processing error the matcher calls `basic.reject` with
   requeue (never `nack`, which would not count toward the limit).
-- **Attempt cap:** after 3 deliveries the queue dead-letters the message; a dead-letter consumer writes `FAILED`/`MAX_ATTEMPTS`
+- **Attempt cap:** after 3 deliveries (`x-delivery-limit=2`) the queue dead-letters the message; a dead-letter consumer writes `FAILED`/`MAX_ATTEMPTS`
   with the same guarded write and acks.
 - **Crash and stall (NFR-6, 30 s):** a crashed replica's connection closes and RabbitMQ requeues its unacked message at once
   (counted as a delivery). A stalled-but-connected worker is not covered by RabbitMQ's consumer timeout (≥ 1 min), so the matcher
   bounds processing itself: a per-message deadline (DB statement timeout + bounded compute, default 10 s) after which it rejects
-  the message; a hung JVM fails its healthcheck and is restarted, closing its connection.
+  the message. A hung JVM fails its healthcheck, but plain docker compose does not restart unhealthy containers – its
+  message is redelivered only when the connection closes (process exit, heartbeat timeout); an orchestrator with liveness
+  restarts closes this gap (README Known limitations).
 - **Exactly-once outcome** rests, as before, on the guarded terminal write plus the V2 trigger (decided rows are immutable);
   delivery is at-least-once. Erasure (ADR-007) is unchanged: it fails pending rows in the DB; a later message is a no-op.
 - **Lease columns** (`lease_token`, `lease_until`, `attempts`) and the poll/claim/reaper code are removed (migration V4).

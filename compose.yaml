@@ -1,12 +1,15 @@
-# docker compose up --build – postgres, gateway (public 8080) and 3 matcher replicas.
+# docker compose up --build – postgres, rabbitmq, gateway (public 8080) and 3 matcher replicas.
 # The DB password is generated on first start into the dbcreds volume (never in git, D-21). Postgres reads it via
 # POSTGRES_PASSWORD_FILE; the apps read it via Spring's configtree import, where the file name becomes the property name.
+# The broker password is generated the same way into mqcreds (apps) and mqconf (RabbitMQ's conf.d) – ADR-009.
 name: match-gateway
 
 x-app-db: &app-db
   DB_URL: jdbc:postgresql://postgres:5432/matchgw
   DB_USER: matchgw
-  SPRING_CONFIG_IMPORT: optional:configtree:/run/dbcreds/
+  RABBITMQ_HOST: rabbitmq
+  RABBITMQ_USER: matchgw
+  SPRING_CONFIG_IMPORT: optional:configtree:/run/dbcreds/,optional:configtree:/run/mqcreds/
 
 # Token settings shared by the gateway (validation) and the devtoken tool (minting) – ADR-004.
 x-jwt: &jwt
@@ -57,6 +60,73 @@ services:
     volumes:
       - dbcreds:/out
     restart: "no"
+
+  # Generates the broker password once. The apps read it from mqcreds; RabbitMQ reads a conf.d file (owner uid 999, 0400)
+  # that also replaces the image defaults, so no `guest` user exists. The broker user is not an administrator.
+  mq-init:
+    image: postgres:17@sha256:2d2b8998d31037bf721cfdf764d76ba74171b4fab3431b7f72c27c56ddbdf9e3
+    entrypoint:
+      - sh
+      - -ec
+      - |
+        [ -s /creds/RABBITMQ_PASSWORD ] || (umask 077 && head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > /creds/RABBITMQ_PASSWORD)
+        chmod 0444 /creds/RABBITMQ_PASSWORD
+        umask 077
+        # Docker copies the image's default conf.d into a fresh volume (incl. `loopback_users.guest = false`): keep only ours.
+        find /conf -mindepth 1 ! -name 90-matchgw.conf ! -name enabled_plugins -delete
+        {
+          echo 'log.console = true'
+          echo 'management_agent.disable_metrics_collector = true'
+          echo 'default_user = matchgw'
+          echo "default_pass = $$(cat /creds/RABBITMQ_PASSWORD)"
+          echo 'default_user_tags.administrator = false'
+        } > /conf/90-matchgw.conf
+        chown 999:999 /conf/90-matchgw.conf
+        chmod 0400 /conf/90-matchgw.conf
+        # No plugins: the image enables rabbitmq_prometheus (unauthenticated :15692) that nothing scrapes (code review step 11).
+        echo '[].' > /conf/enabled_plugins
+        chown 999:999 /conf/enabled_plugins
+        chmod 0444 /conf/enabled_plugins
+    network_mode: none
+    volumes:
+      - mqcreds:/creds
+      - mqconf:/conf
+    restart: "no"
+
+  rabbitmq:
+    image: rabbitmq:4.3@sha256:42b190dffdd0cdb656f989f5404c30e1049d6b7d9c987089669b1905e5e3a1a6
+    # Runs directly as the image's rabbitmq user: the entrypoint's root → gosu switch would need dropped capabilities.
+    user: "999:999"
+    environment:
+      RABBITMQ_ENABLED_PLUGINS_FILE: /etc/rabbitmq/conf.d/enabled_plugins # only *.conf files are read as config
+      # Single node: Erlang distribution and epmd listen on loopback only, so no other container can reach 25672/4369
+      # (security review step 11); rabbitmqctl inside the container still works.
+      # Fixed node name: the data directory is keyed by node name (a hostname-based name changes with every recreated
+      # container and would orphan the queues in mqdata), and localhost resolves to the loopback-only epmd.
+      RABBITMQ_NODENAME: rabbit@localhost
+      ERL_EPMD_ADDRESS: 127.0.0.1
+      RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: "-kernel inet_dist_use_interface {127,0,0,1}"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    mem_limit: 512m
+    volumes:
+      - mqconf:/etc/rabbitmq/conf.d:ro
+      - mqdata:/var/lib/rabbitmq
+    depends_on:
+      mq-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+    # no ports: the broker is reachable only inside the compose network
 
   # Generates the RS256 key pair + idempotency HMAC key on first start (ADR-004). The private key goes only to the
   # issuer-keys volume, which the gateway never mounts.
@@ -117,11 +187,14 @@ services:
       IDEMPOTENCY_HMAC_KEY_LOCATION: file:/run/keys/idempotency-hmac.key
     volumes:
       - dbcreds:/run/dbcreds:ro
+      - mqcreds:/run/mqcreds:ro
       - gateway-keys:/run/keys:ro
     ports:
       - "127.0.0.1:8080:8080" # API + standard actuator health on localhost only (plain HTTP)
     depends_on:
       postgres:
+        condition: service_healthy
+      rabbitmq:
         condition: service_healthy
       keygen:
         condition: service_completed_successfully
@@ -136,15 +209,21 @@ services:
     environment: *app-db
     volumes:
       - dbcreds:/run/dbcreds:ro
+      - mqcreds:/run/mqcreds:ro
     deploy:
       replicas: 3
     depends_on:
       postgres:
+        condition: service_healthy
+      rabbitmq:
         condition: service_healthy
     healthcheck: *health
 
 volumes:
   dbcreds:
   pgdata:
+  mqcreds:
+  mqconf:
+  mqdata:
   issuer-keys:
   gateway-keys:

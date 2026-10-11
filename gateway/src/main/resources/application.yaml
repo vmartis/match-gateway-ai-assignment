@@ -13,6 +13,12 @@ spring:
   threads:
     virtual:
       enabled: true
+  # Broker (ADR-009): password from the generated mqcreds configtree (compose), never in the repo.
+  rabbitmq:
+    host: ${RABBITMQ_HOST:localhost}
+    port: 5672
+    username: ${RABBITMQ_USER:matchgw}
+    password: ${RABBITMQ_PASSWORD:}
   datasource:
     url: ${DB_URL:jdbc:postgresql://localhost:5432/matchgw}
     username: ${DB_USER:matchgw}
@@ -52,7 +58,7 @@ management:
         enabled: true
       group:
         readiness:
-          include: readinessState,db # D-24: not ready while the database is unreachable
+          include: readinessState,db,rabbit # D-24 + ADR-009: not ready while the database or broker is unreachable
   health:
     probes:
       enabled: true
