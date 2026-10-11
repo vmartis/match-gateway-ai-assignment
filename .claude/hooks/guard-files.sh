@@ -47,9 +47,11 @@ if ((!is_test)); then
   # Quoted literal: password = "x", "password": "x", password: 'x' (env refs like "${X}" are allowed)
   has_i "${key}[\"']?[[:space:]]*(:|=|:=)[[:space:]]*[\"'][^\"'\$]{3,}[\"']" \
     && block "looks like a hardcoded secret (password/secret/api key literal). Use env/config."
-  # Unquoted value in config files: password: hunter2 / password=hunter2
+  # Unquoted value in config files: password: hunter2 / password=hunter2 / ${DB_PASSWORD:hunter2}.
+  # An empty env default (`${DB_PASSWORD:}`) is allowed: `}` cannot start a value. `{` is a key boundary,
+  # so `${PASSWORD:hunter2}` is caught too.
   if [[ "$base" =~ \.(ya?ml|properties|conf|ini|toml)$ ]]; then
-    has_i "(^|[[:space:]_.-])${key}[[:space:]]*(:|=)[[:space:]]*[^[:space:]\$\"'{#][^[:space:]]*" \
+    has_i "(^|[[:space:]_.{-])${key}[[:space:]]*(:|=)[[:space:]]*[^[:space:]\$\"'{}#][^[:space:]]*" \
       && block "looks like a hardcoded secret in config. Use \${ENV_VAR}."
   fi
 fi

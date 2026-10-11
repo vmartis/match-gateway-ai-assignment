@@ -1,0 +1,35 @@
+spring:
+  application:
+    name: matcher
+  threads:
+    virtual:
+      enabled: true
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/matchgw}
+    username: ${DB_USER:matchgw}
+    password: ${DB_PASSWORD:}
+    hikari:
+      data-source-properties:
+        # PSQLException messages must never inline row values (probe bytes) – ARCHITECTURE T3.
+        logServerErrorDetail: false
+
+# The matcher has no public API: only actuator, reachable inside the compose network (D-6).
+server:
+  port: 8081
+  error:
+    include-message: never
+    include-stacktrace: never
+    include-binding-errors: never
+    include-exception: false
+    whitelabel:
+      enabled: false
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
+  endpoint:
+    health:
+      show-details: never
+      show-components: never
