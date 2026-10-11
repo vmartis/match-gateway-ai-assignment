@@ -8,7 +8,7 @@
 | id | question / assumption | impact | default chosen | must-confirm |
 |---|---|---|---|---|
 | AM-1 | **Where does the dev token tool live?** D-7 names three modules (`gateway`, `matcher`, `common`). D-4 needs a minting tool. That tool must not sit in the gateway, because the gateway must never hold the private key. Python stdlib cannot sign RS256. A shell/openssl JWT would be hand-rolled, which CLAUDE.md §4 forbids. | Module layout, AC-1, AC-5 | A 4th Gradle module **`devtoken`**: plain Kotlin, no Spring Boot, uses `NimbusJwtEncoder` from `spring-security-oauth2-jose`. It has two commands. `keygen` runs as a one-shot compose service. `mint` runs as `docker compose run --rm devtoken mint …`, wrapped by `scripts/token.sh`. | **yes** |
-| AM-2 | **Dev DB password.** A literal password in `compose.yaml` is arguably a "secret tracked by git" (AC-1), and the guard hook blocks `POSTGRES_PASSWORD: <literal>` in YAML. | AC-1, gitleaks | **Resolved by critique:** `POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-…}` with a local default (human's skeleton instruction), DB port not published, labelled dev-only in README. | no |
+| AM-2 | **Dev DB password.** No literal password in git (AC-1); the guard hook blocks literal defaults in YAML. | AC-1, gitleaks | **Resolved by D-21 (step 1b):** one-shot `db-init` writes 32 random bytes (hex) into the `dbcreds` volume; postgres reads `POSTGRES_PASSWORD_FILE`, the apps use `SPRING_CONFIG_IMPORT=optional:configtree:/run/dbcreds/`. DB port not published. | no (resolved) |
 | AM-3 | **Scope check order.** `@PreAuthorize` runs after `@RequestBody` binding, so a caller without the scope gets body parsing and a 400 validation oracle instead of 403. | AC-7 semantics, A01/API5 | **Critique recommends:** URL-level `authorizeHttpRequests` rules (`hasAuthority('SCOPE_x')` per method + path) in the SecurityFilterChain – reject before the body is read; tenant ownership stays in SQL. Requires changing CLAUDE.md §4 "@PreAuthorize for role checks". | **yes** |
 | AM-4 | **osv-scanner lockfile.** `verify.sh` runs `osv-scanner … --lockfile gradle.lockfile`. A multi-module build writes per-module lockfiles. | verify.sh fails wherever osv-scanner is installed | Turn on `dependencyLocking { lockAllConfigurations() }` in every module. Change the line to `osv-scanner scan source -r .`, which auto-detects lockfiles. | **yes** (human's gate script) |
 | AM-5 | **Public health path.** D-6 puts actuator on management port 8081; AC-2 wants `/actuator/health` reachable on the public port. | AC-2, AC-52 | **Resolved by D-19 (step 1a):** Boot 4.1.1 rejects multi-segment additional paths, so a delegating `PublicHealthController` serves GET `/actuator/health` on 8080 (status only, 503 when not UP); `ManagementPortGuard` enforces a separate management port. See ADR-006 amendment. | no (resolved) |
@@ -96,7 +96,7 @@ devtoken/  …devtoken                  Main: `keygen`, `mint --tenant --sub --s
 ```
 
 **Compose services:**
-- `postgres` (17-alpine, `-c log_error_verbosity=terse`, no host port)
+- `postgres` (17, pinned by digest, `-c log_error_verbosity=terse`, no host port)
 - `keygen` (devtoken image, one-shot). It writes:
   - volume `issuer-keys`: `jwt-private.pem` mode 0400 and `jwt-public.pem`
   - volume `gateway-keys`: `jwt-public.pem` and `idempotency-hmac.key` (32 random bytes)

@@ -1,0 +1,100 @@
+# docker compose up --build – postgres, gateway (public 8080) and 3 matcher replicas.
+# The DB password is generated on first start into the dbcreds volume (never in git, D-21). Postgres reads it via
+# POSTGRES_PASSWORD_FILE; the apps read it via Spring's configtree import, where the file name becomes the property name.
+name: match-gateway
+
+x-app-db: &app-db
+  DB_URL: jdbc:postgresql://postgres:5432/matchgw
+  DB_USER: matchgw
+  SPRING_CONFIG_IMPORT: optional:configtree:/run/dbcreds/
+
+# Container hardening for the JVM services (security review 1b). The read-only root FS needs a writable /tmp.
+x-hardening: &hardening
+  read_only: true
+  tmpfs:
+    - /tmp
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  pids_limit: 512
+
+# Healthcheck without curl/wget in the image: a plain HTTP request over bash's /dev/tcp.
+x-health: &health
+  test:
+    - CMD
+    - bash
+    - -c
+    - "exec 3<>/dev/tcp/127.0.0.1/8081 && printf 'GET /actuator/health HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && grep -q '\"status\":\"UP\"' <&3"
+  interval: 3s
+  timeout: 3s
+  retries: 40
+  start_period: 10s
+
+services:
+  db-init:
+    image: postgres:17@sha256:2d2b8998d31037bf721cfdf764d76ba74171b4fab3431b7f72c27c56ddbdf9e3
+    entrypoint:
+      - sh
+      - -c
+      - '[ -s /out/DB_PASSWORD ] || (umask 022 && head -c 32 /dev/urandom | od -An -tx1 | tr -d " \n" > /out/DB_PASSWORD)'
+    volumes:
+      - dbcreds:/out
+    restart: "no"
+
+  postgres:
+    image: postgres:17@sha256:2d2b8998d31037bf721cfdf764d76ba74171b4fab3431b7f72c27c56ddbdf9e3
+    command: ["postgres", "-c", "log_error_verbosity=terse"]
+    environment:
+      POSTGRES_USER: matchgw
+      POSTGRES_DB: matchgw
+      POSTGRES_PASSWORD_FILE: /run/dbcreds/DB_PASSWORD
+    volumes:
+      - dbcreds:/run/dbcreds:ro
+      - pgdata:/var/lib/postgresql/data
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+    healthcheck:
+      # TCP, not the unix socket: the image's temporary init server listens on the socket only.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U matchgw -d matchgw"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    # no ports: the database is reachable only inside the compose network
+
+  gateway:
+    <<: *hardening
+    build:
+      context: .
+      target: gateway
+    mem_limit: 768m
+    environment: *app-db
+    volumes:
+      - dbcreds:/run/dbcreds:ro
+    ports:
+      - "127.0.0.1:8080:8080" # API on localhost only (plain HTTP); management port 8081 stays internal (D-6)
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck: *health
+
+  matcher:
+    <<: *hardening
+    build:
+      context: .
+      target: matcher
+    mem_limit: 512m
+    environment: *app-db
+    volumes:
+      - dbcreds:/run/dbcreds:ro
+    deploy:
+      replicas: 3
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck: *health
+
+volumes:
+  dbcreds:
+  pgdata:

@@ -1,0 +1,15 @@
+# Only sources and the Gradle wrapper go into the build context – never secrets, build output or local tooling.
+**
+!gradlew
+!gradle/wrapper/**
+!settings.gradle.kts
+!build.gradle.kts
+!gradle.properties
+!common/**
+!gateway/**
+!matcher/**
+**/build/
+**/.gradle/
+**/*.pem
+**/*.key
+**/.env*

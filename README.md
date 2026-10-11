@@ -4,7 +4,19 @@ Multi-tenant asynchronous 1:1 face-template verification: a JWT-protected `gatew
 workers over PostgreSQL. Specification: [docs/SPEC.md](docs/SPEC.md); design: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and
 [docs/adr/](docs/adr/); plan and progress: [docs/PLAN.md](docs/PLAN.md); AI usage: [docs/AI_LOG.md](docs/AI_LOG.md).
 
-> Work in progress – run instructions, API usage, evaluation and load-test results are added as the plan steps land.
+> Work in progress – API usage, evaluation and load-test results are added as the plan steps land.
+
+## Run
+
+```
+docker compose up --build        # postgres, gateway (http://127.0.0.1:8080) and 3 matcher replicas
+curl http://127.0.0.1:8080/actuator/health
+docker compose down -v           # also deletes the generated DB password and all data
+```
+
+Prerequisite: Docker with Compose v2 – no local JDK needed. The DB password is generated on first start into the `dbcreds`
+volume and never leaves the compose network; `down -v` resets it together with the data (removing only one of the two
+volumes leaves postgres with a password it no longer accepts).
 
 ## Known limitations
 
@@ -14,5 +26,7 @@ Accepted review findings and deliberate scope cuts, each with the risk and what 
 |---|---|---|
 | Public `GET /actuator/health` runs the full health check (incl. a DB connection) for anonymous callers (security review, step 1a) | Anonymous health floods compete with API traffic for the Hikari pool; no rate limiting (D-2) | Cache the status for ~1 s or expose only a `ping` group publicly; per-client rate limiting at the edge |
 | Build plugin classpath (Kotlin, Boot, dependency-management, ktlint plugins) is not dependency-locked or osv-scanned; ktlint tool configurations are excluded on purpose (D-20) | A compromised build plugin runs at build time (not shipped in images) | Lock the buildscript/settings classpath and scan it as well |
-| Gateway and matcher share one DB user that also owns the schema (Flyway DDL rights) | A compromised matcher or a future SQL injection would have DDL rights | Separate roles: migration owner for Flyway only, DML-only runtime roles per app |
+| Gateway and matcher connect as the bootstrap role `matchgw`, which is a **Postgres superuser** (security review 1b proved `COPY … FROM PROGRAM 'id'` runs as uid 999 in the DB container) | A future SQL injection or a compromised app container would get full data access and command execution in the DB container | Split roles: superuser only for bootstrap, a schema-owner role for Flyway, NOSUPERUSER DML-only login roles per app (second generated password + `docker-entrypoint-initdb.d` script) |
 | Schema CHECKs on `verification.subject_id`, `idempotency_key.idem_key` and `tenant_id` formats are left to the API layer | Defence in depth only – the API validates these inputs | Add matching CHECK constraints |
+| Base image `eclipse-temurin:25-jre` (Ubuntu 26.04) carries OS-package CVEs: 86 advisories in 19 packages, 0 critical, 15 fixable (Go stdlib in `pebble`, freetype, libpng) – none in our layers (security review 1b, `osv-scanner scan image`) | Exploitable only via those OS components, which the JVM app does not invoke | Rebuild on new base releases (digest bump); evaluate a chiseled/distroless JRE (needs an ADR – healthchecks use bash) |
+| The API is plain HTTP (no TLS in compose); bound to 127.0.0.1 only | Bearer tokens in cleartext if the port were exposed beyond localhost | Terminate TLS at an ingress/reverse proxy; enable HSTS there |

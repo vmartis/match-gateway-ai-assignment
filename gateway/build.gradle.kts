@@ -40,3 +40,8 @@ tasks.register<Test>("securityTest") {
     classpath = sourceSets["test"].runtimeClasspath
     useJUnitPlatform { includeTags("security") }
 }
+
+// Stable name for the Docker image (Dockerfile copies build/libs/app.jar).
+tasks.named<org.springframework.boot.gradle.tasks.bundling.BootJar>("bootJar") {
+    archiveFileName.set("app.jar")
+}
