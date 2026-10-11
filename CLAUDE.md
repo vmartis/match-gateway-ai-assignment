@@ -45,7 +45,8 @@
   - Pin the expected algorithm; reject alg=none.
   - Validate exp, nbf, iss, aud (JwtValidators + audience validator). TTL ≤ 15 min. Clock skew ≤ 60 s.
   - Authorities from the `scope` claim → `SCOPE_*` via JwtAuthenticationConverter (D-5); `tenant_id` claim required.
-  - @PreAuthorize for role checks; explicit owner checks for object access.
+  - Scope checks as URL-level rules in the SecurityFilterChain (reject before the body is read, D-18);
+    tenant ownership enforced in every SQL statement (`tenant_id` from the JWT only).
   - 401 + WWW-Authenticate for missing/invalid token; 403 for insufficient rights.
   - Other tenants' resources → 404, never 403 (brief); missing scope → 403. If a token endpoint is ever added: identical
     error body for "unknown user" and "wrong password".
