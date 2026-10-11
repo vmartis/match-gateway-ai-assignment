@@ -118,6 +118,9 @@ Other build and runtime choices:
 
 ### Matcher protocol (D-3, ADR-003)
 
+> **Superseded by D-28 / ADR-009 (RabbitMQ + transactional outbox).** This section describes the implemented
+> state until PLAN steps 11–14 land; step 14 rewrites it.
+
 **Claim** (one short transaction):
 
 ```sql

@@ -1,6 +1,6 @@
 # ADR-003: PostgreSQL SKIP LOCKED queue and exactly-once outcome
 
-- **Status:** Proposed
+- **Status:** Superseded by ADR-009 (D-28)
 - **Date:** 2026-10-11
 - **Deciders:** human (+ AI proposal, architect subagent)
 

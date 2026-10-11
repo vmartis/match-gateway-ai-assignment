@@ -19,6 +19,7 @@
   springdoc-openapi 3.x (Boot 4 line; verify the exact version).
 - Auth: JWT only. Spring Security 7.1 OAuth2 Resource Server (spring-boot-starter-oauth2-resource-server), stateless Bearer.
 - DB: PostgreSQL 17 + Flyway (spring-boot-starter-flyway + flyway-database-postgresql). Persistence: Spring Data JDBC.
+- Messaging: RabbitMQ 4.x (spring-boot-starter-amqp), quorum queues, transactional outbox (ADR-009, D-28).
 - Tests: JUnit 6 (Jupiter), MockK + springmockk, AssertJ, RestTestClient, Testcontainers 2.x (@ServiceConnection), ArchUnit.
 - Modules (D-7): Gradle multi-module `gateway`, `matcher`, small `common` (shared only where truly shared). Flyway migrations owned by gateway.
 - Frontend: none. Lint: ktlint Gradle plugin. Runtime: Docker + docker compose (`docker compose up --build` starts everything).
