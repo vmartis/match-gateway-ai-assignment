@@ -20,6 +20,7 @@
 - Auth: JWT only. Spring Security 7.1 OAuth2 Resource Server (spring-boot-starter-oauth2-resource-server), stateless Bearer.
 - DB: PostgreSQL 17 + Flyway (spring-boot-starter-flyway + flyway-database-postgresql). Persistence: Spring Data JDBC.
 - Tests: JUnit 6 (Jupiter), MockK + springmockk, AssertJ, RestTestClient, Testcontainers 2.x (@ServiceConnection), ArchUnit.
+- Modules (D-7): Gradle multi-module `gateway`, `matcher`, small `common` (shared only where truly shared). Flyway migrations owned by gateway.
 - Frontend: none. Lint: ktlint Gradle plugin. Runtime: Docker + docker compose (`docker compose up --build` starts everything).
 
 ## 3. Architecture rules
@@ -34,17 +35,20 @@
 - Passwords only through PasswordEncoder. Owner check on every resource access (no IDOR).
 - Never log PII, biometric data, tokens, or full Authorization headers.
 - Uploads: size limit, magic-byte type check, ignore the client filename.
-- Explicit CORS allowlist. Deny-by-default security config. Actuator exposes health only.
-- Authentication = JWT only, app-issued: POST /api/auth/token, NimbusJwtEncoder, RS256 key pair from env/mounted file, TTL 15 min.
+- Explicit CORS allowlist. Deny-by-default security config. Actuator: health public; prometheus only on the internal
+  management port (D-6); nothing else exposed.
+- Authentication = JWT only (RS256). Tokens are minted by a dev script with NimbusJwtEncoder (D-4); the gateway holds only the
+  public key (env/mounted file) and is a pure resource server. No user/password store. TTL 15 min.
   - Never HTTP Basic, never form login, never sessions (SessionCreationPolicy.STATELESS).
   - Use oauth2ResourceServer + NimbusJwtDecoder/NimbusJwtEncoder. Never a hand-written JWT filter or parser.
   - Asymmetric signing only (RS256/ES256). Key from env or mounted file, never in the repo.
   - Pin the expected algorithm; reject alg=none.
   - Validate exp, nbf, iss, aud (JwtValidators + audience validator). TTL ≤ 15 min. Clock skew ≤ 60 s.
-  - Authorities from a dedicated claim (roles/scope) via JwtAuthenticationConverter.
+  - Authorities from the `scope` claim → `SCOPE_*` via JwtAuthenticationConverter (D-5); `tenant_id` claim required.
   - @PreAuthorize for role checks; explicit owner checks for object access.
   - 401 + WWW-Authenticate for missing/invalid token; 403 for insufficient rights.
-  - Token endpoint: identical error body for "unknown user" and "wrong password".
+  - Other tenants' resources → 404, never 403 (brief); missing scope → 403. If a token endpoint is ever added: identical
+    error body for "unknown user" and "wrong password".
   - CSRF disabled only because the API is stateless, bearer-only, with no cookies. Record this reason in an ADR.
 - Security headers on every response: HSTS, X-Content-Type-Options, frame-ancestors 'none', Referrer-Policy,
   Cache-Control: no-store on auth/PII responses.
