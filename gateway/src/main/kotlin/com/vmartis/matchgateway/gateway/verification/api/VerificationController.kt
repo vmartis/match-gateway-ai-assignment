@@ -4,6 +4,8 @@ import com.fasterxml.jackson.annotation.JsonInclude
 import com.vmartis.matchgateway.common.template.TemplateCodec
 import com.vmartis.matchgateway.gateway.auth.api.tenantId
 import com.vmartis.matchgateway.gateway.subject.api.SUBJECT_ID_PATTERN
+import com.vmartis.matchgateway.gateway.verification.domain.IdempotencyOutcome
+import com.vmartis.matchgateway.gateway.verification.infra.Fingerprinter
 import com.vmartis.matchgateway.gateway.verification.infra.VerificationStore
 import com.vmartis.matchgateway.gateway.verification.infra.VerificationView
 import jakarta.servlet.http.HttpServletRequest
@@ -59,6 +61,7 @@ data class VerificationResult(
 @RestController
 class VerificationController(
     private val verifications: VerificationStore,
+    private val fingerprinter: Fingerprinter,
 ) {
     @PostMapping(
         "/v1/verifications",
@@ -66,7 +69,6 @@ class VerificationController(
         produces = [MediaType.APPLICATION_JSON_VALUE],
     )
     fun submit(
-        // Validated only in this step; idempotent replay is step 9 (D-10).
         @RequestHeader(IDEMPOTENCY_KEY_HEADER) @Pattern(regexp = IDEMPOTENCY_KEY_PATTERN) idempotencyKey: String,
         @Valid @RequestBody request: VerificationRequest,
         @AuthenticationPrincipal jwt: Jwt,
@@ -75,12 +77,26 @@ class VerificationController(
         // Spring joins repeated headers with ","; exactly one key header is allowed so a key always has one meaning.
         if (servletRequest.getHeaders(IDEMPOTENCY_KEY_HEADER).toList().size != 1) throw ResponseStatusException(HttpStatus.BAD_REQUEST)
         val probe = TemplateCodec.decode(checkNotNull(request.probeTemplate))
-        val id = verifications.submit(jwt.tenantId(), checkNotNull(request.subjectId), probe)
-        return ResponseEntity
-            .accepted()
-            .location(URI.create("/v1/verifications/$id"))
-            .body(VerificationAccepted(id, "PENDING"))
+        val tenantId = jwt.tenantId()
+        val subjectId = checkNotNull(request.subjectId)
+        val fingerprint = fingerprinter.fingerprint(tenantId, subjectId, probe)
+        return when (val outcome = verifications.submit(tenantId, idempotencyKey, subjectId, probe, fingerprint)) {
+            is IdempotencyOutcome.Created -> verificationResponse(HttpStatus.ACCEPTED, outcome.id, "PENDING")
+            // Replay (AM-12): 202 while PENDING, 200 once decided, always the original id (D-10).
+            is IdempotencyOutcome.Replayed ->
+                verificationResponse(if (outcome.status == "PENDING") HttpStatus.ACCEPTED else HttpStatus.OK, outcome.id, outcome.status)
+            IdempotencyOutcome.KeyReused -> throw ResponseStatusException(HttpStatus.UNPROCESSABLE_CONTENT)
+        }
     }
+
+    private fun verificationResponse(
+        status: HttpStatus,
+        id: UUID,
+        verificationStatus: String,
+    ) = ResponseEntity
+        .status(status)
+        .location(URI.create("/v1/verifications/$id"))
+        .body(VerificationAccepted(id, verificationStatus))
 
     @GetMapping("/v1/verifications/{verificationId}", produces = [MediaType.APPLICATION_JSON_VALUE])
     fun get(

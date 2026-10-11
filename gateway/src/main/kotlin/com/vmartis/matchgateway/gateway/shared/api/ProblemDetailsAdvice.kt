@@ -7,6 +7,7 @@ import org.springframework.http.HttpStatus
 import org.springframework.http.HttpStatusCode
 import org.springframework.http.MediaType
 import org.springframework.http.ResponseEntity
+import org.springframework.security.web.firewall.RequestRejectedException
 import org.springframework.web.bind.annotation.ExceptionHandler
 import org.springframework.web.bind.annotation.RestControllerAdvice
 import org.springframework.web.context.request.WebRequest
@@ -39,6 +40,11 @@ class ProblemDetailsAdvice : ResponseEntityExceptionHandler() {
 
     @ExceptionHandler(InvalidTemplateException::class)
     fun invalidTemplate(): ResponseEntity<Any> = Problems.response(HttpStatus.BAD_REQUEST)
+
+    // StrictHttpFirewall validates header values lazily: a rejected value surfaces inside the handler, not the filter
+    // chain. It is a client error, not a 500 with an ERROR log line (security review step 9).
+    @ExceptionHandler(RequestRejectedException::class)
+    fun requestRejected(): ResponseEntity<Any> = Problems.response(HttpStatus.BAD_REQUEST)
 
     @ExceptionHandler(Exception::class)
     fun unexpected(ex: Exception): ResponseEntity<Any> {

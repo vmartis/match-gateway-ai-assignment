@@ -397,6 +397,55 @@ class LeakageIT : GatewayIntegrationTest() {
     }
 
     @Test
+    fun `A09 AC-41 idempotent replay and 422 key reuse never leak templates or tokens into logs or bodies`(output: CapturedOutput) {
+        val token = JwtTestTokens.valid(scope = "enroll verify admin")
+        val t1 = valid(11).base64
+        val t2 = valid(12).base64
+        val first =
+            call(HttpMethod.POST, "/v1/verifications", token, body = """{"subjectId":"s1","probeTemplate":"$t1"}""", idempotencyKey = "k-r")
+        val replay =
+            call(HttpMethod.POST, "/v1/verifications", token, body = """{"subjectId":"s1","probeTemplate":"$t1"}""", idempotencyKey = "k-r")
+        val reusedProbe =
+            call(HttpMethod.POST, "/v1/verifications", token, body = """{"subjectId":"s1","probeTemplate":"$t2"}""", idempotencyKey = "k-r")
+        val reusedSubject =
+            call(HttpMethod.POST, "/v1/verifications", token, body = """{"subjectId":"s2","probeTemplate":"$t1"}""", idempotencyKey = "k-r")
+
+        assertThat(first.status).isEqualTo(202)
+        assertThat(replay.status).isEqualTo(202)
+        assertThat(replay.body).isEqualTo(first.body)
+        assertThat(reusedProbe.status).isEqualTo(422)
+        assertThat(reusedSubject.status).isEqualTo(422)
+        assertThat(reusedProbe.body).isEqualTo(reusedSubject.body)
+        assertNoLeak(output, tokenSecrets(token) + fragments(t1) + fragments(t2) + "k-r")
+    }
+
+    @Test
+    fun `A02 AC-44 a 422 key reuse response carries nosniff and no-store`() {
+        val token = JwtTestTokens.valid(scope = "verify")
+        call(
+            HttpMethod.POST,
+            "/v1/verifications",
+            token,
+            body = """{"subjectId":"s1","probeTemplate":"${valid(13).base64}"}""",
+            idempotencyKey = "k-422",
+        )
+
+        val r =
+            call(
+                HttpMethod.POST,
+                "/v1/verifications",
+                token,
+                body = """{"subjectId":"s1","probeTemplate":"${valid(14).base64}"}""",
+                idempotencyKey = "k-422",
+            )
+
+        assertThat(r.status).isEqualTo(422)
+        assertThat(r.contentType).isEqualTo(MediaType.APPLICATION_PROBLEM_JSON)
+        assertThat(r.headers.getFirst("X-Content-Type-Options")).isEqualTo("nosniff")
+        assertThat(r.headers.getFirst(HttpHeaders.CACHE_CONTROL)).contains("no-store")
+    }
+
+    @Test
     fun `A02 AC-44 the public health endpoint also carries nosniff and no-store`() {
         val r = call(HttpMethod.GET, "/actuator/health")
 

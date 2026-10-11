@@ -18,6 +18,7 @@ abstract class GatewayIntegrationTest {
         @DynamicPropertySource
         fun jwtProperties(registry: DynamicPropertyRegistry) {
             registry.add("app.jwt.public-key-location") { JwtTestTokens.publicKeyLocation }
+            registry.add("app.idempotency.hmac-key-location") { TestHmacKey.location }
         }
     }
 }

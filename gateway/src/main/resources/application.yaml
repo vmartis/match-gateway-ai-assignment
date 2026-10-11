@@ -63,3 +63,5 @@ app:
     public-key-location: ${JWT_PUBLIC_KEY_LOCATION:file:/run/keys/jwt-public.pem}
     issuer: ${JWT_ISSUER:https://match-gateway.invalid/dev-issuer}
     audience: ${JWT_AUDIENCE:match-gateway}
+  idempotency:
+    hmac-key-location: ${IDEMPOTENCY_HMAC_KEY_LOCATION:file:/run/keys/idempotency-hmac.key}

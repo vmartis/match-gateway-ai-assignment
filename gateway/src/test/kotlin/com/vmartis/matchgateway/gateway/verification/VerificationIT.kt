@@ -7,11 +7,14 @@ import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.extension.ExtendWith
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.Arguments
 import org.junit.jupiter.params.provider.MethodSource
 import org.junit.jupiter.params.provider.ValueSource
 import org.springframework.beans.factory.annotation.Autowired
+import org.springframework.boot.test.system.CapturedOutput
+import org.springframework.boot.test.system.OutputCaptureExtension
 import org.springframework.boot.test.web.server.LocalServerPort
 import org.springframework.http.HttpHeaders
 import org.springframework.http.MediaType
@@ -90,6 +93,18 @@ class VerificationIT : GatewayIntegrationTest() {
         subjectId: String = "subj-001",
         template: String = TestTemplates.unit(),
     ) = """{"subjectId":"$subjectId","probeTemplate":"$template"}"""
+
+    @Test
+    @Tag("security")
+    @ExtendWith(OutputCaptureExtension::class)
+    fun `AC-15 A10 a non-ASCII UTF-8 Idempotency-Key is a 400, not a 500, and logs no error`(output: CapturedOutput) {
+        // StrictHttpFirewall checks header values lazily, inside the handler (security review step 9, LOW-1).
+        val status = rawSubmit("Idempotency-Key: k-ключ".toByteArray(Charsets.UTF_8))
+
+        assertThat(status).startsWith("HTTP/1.1 400")
+        assertThat(totalRows()).isZero()
+        assertThat(output.all).doesNotContain("ERROR").doesNotContain("RequestRejectedException")
+    }
 
     /** Raw-socket submit: [keyHeaders] are sent verbatim (the HTTP client would normalise or merge them). */
     private fun rawSubmit(keyHeaders: ByteArray): String {

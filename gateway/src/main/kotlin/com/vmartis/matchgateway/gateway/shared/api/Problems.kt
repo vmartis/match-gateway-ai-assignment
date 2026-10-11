@@ -26,6 +26,7 @@ object Problems {
             406 to ("not-acceptable" to "The requested representation is not available."),
             413 to ("payload-too-large" to "The request body is too large."),
             415 to ("unsupported-media-type" to "The content type is not supported."),
+            422 to ("idempotency-key-reused" to "The Idempotency-Key was already used with a different request."),
             500 to ("internal" to "An unexpected error occurred."),
         )
 

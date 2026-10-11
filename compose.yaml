@@ -114,6 +114,7 @@ services:
     environment:
       <<: [*app-db, *jwt]
       JWT_PUBLIC_KEY_LOCATION: file:/run/keys/jwt-public.pem
+      IDEMPOTENCY_HMAC_KEY_LOCATION: file:/run/keys/idempotency-hmac.key
     volumes:
       - dbcreds:/run/dbcreds:ro
       - gateway-keys:/run/keys:ro

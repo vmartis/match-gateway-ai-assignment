@@ -1,7 +1,10 @@
 package com.vmartis.matchgateway.gateway.verification.infra
 
+import com.vmartis.matchgateway.gateway.verification.domain.IdempotencyOutcome
 import org.springframework.jdbc.core.simple.JdbcClient
 import org.springframework.stereotype.Repository
+import org.springframework.transaction.support.TransactionTemplate
+import java.security.MessageDigest
 import java.sql.ResultSet
 import java.time.Instant
 import java.util.UUID
@@ -20,27 +23,104 @@ data class VerificationView(
 @Repository
 class VerificationStore(
     private val jdbc: JdbcClient,
+    private val transactions: TransactionTemplate,
 ) {
-    /** The verification row is the matcher's job (ADR-003): PENDING with the probe until it is decided (D-11). */
+    /**
+     * Creates a PENDING verification (the matcher's job, ADR-003; probe kept until decided, D-11) bound to the tenant's
+     * Idempotency-Key (ADR-008). The key row's primary key is the concurrency guarantee (AC-21): a key in use within
+     * 24 h makes the upsert return nothing, the new verification is rolled back, and the stored record decides.
+     */
     fun submit(
         tenantId: String,
+        idempotencyKey: String,
         subjectId: String,
         probe: ByteArray,
-    ): UUID {
-        val id = UUID.randomUUID()
+        fingerprint: ByteArray,
+    ): IdempotencyOutcome {
+        // The key record can vanish between the rollback and the read only through erasure (ADR-007): then submit anew.
+        // Each retry needs another enrol + concurrent submit + erase of the same subject, so a small bound suffices.
+        repeat(MAX_ATTEMPTS) {
+            attempt(tenantId, idempotencyKey, subjectId, probe, fingerprint)?.let { return it }
+        }
+        error("idempotency record kept vanishing")
+    }
+
+    private fun attempt(
+        tenantId: String,
+        idempotencyKey: String,
+        subjectId: String,
+        probe: ByteArray,
+        fingerprint: ByteArray,
+    ): IdempotencyOutcome? {
+        val created =
+            transactions.execute { tx ->
+                val id = UUID.randomUUID()
+                jdbc
+                    .sql(
+                        """
+                        INSERT INTO verification (id, tenant_id, subject_id, status, probe, attempts)
+                        VALUES (:id, :tenant, :subject, 'PENDING', :probe, 0)
+                        """.trimIndent(),
+                    ).param("id", id)
+                    .param("tenant", tenantId)
+                    .param("subject", subjectId)
+                    .param("probe", probe)
+                    .update()
+                val bound =
+                    jdbc
+                        .sql(
+                            """
+                            INSERT INTO idempotency_key (tenant_id, idem_key, fingerprint, verification_id)
+                            VALUES (:tenant, :key, :fingerprint, :id)
+                            ON CONFLICT (tenant_id, idem_key) DO UPDATE
+                               SET fingerprint = EXCLUDED.fingerprint, verification_id = EXCLUDED.verification_id, created_at = now()
+                             WHERE idempotency_key.created_at < now() - interval '24 hours'
+                            RETURNING verification_id
+                            """.trimIndent(),
+                        ).param("tenant", tenantId)
+                        .param("key", idempotencyKey)
+                        .param("fingerprint", fingerprint)
+                        .param("id", id)
+                        .query(UUID::class.java)
+                        .optional()
+                if (bound.isEmpty) tx.setRollbackOnly()
+                bound.orElse(null)
+            }
+        if (created != null) return IdempotencyOutcome.Created(created)
+        val existing = findKey(tenantId, idempotencyKey) ?: return null
+        return if (MessageDigest.isEqual(existing.fingerprint, fingerprint)) {
+            IdempotencyOutcome.Replayed(existing.verificationId, existing.status)
+        } else {
+            IdempotencyOutcome.KeyReused
+        }
+    }
+
+    private companion object {
+        const val MAX_ATTEMPTS = 3
+    }
+
+    private class KeyRecord(
+        val fingerprint: ByteArray,
+        val verificationId: UUID,
+        val status: String,
+    )
+
+    private fun findKey(
+        tenantId: String,
+        idempotencyKey: String,
+    ): KeyRecord? =
         jdbc
             .sql(
                 """
-                INSERT INTO verification (id, tenant_id, subject_id, status, probe, attempts)
-                VALUES (:id, :tenant, :subject, 'PENDING', :probe, 0)
+                SELECT k.fingerprint, v.id, v.status
+                  FROM idempotency_key k JOIN verification v ON v.id = k.verification_id AND v.tenant_id = k.tenant_id
+                 WHERE k.tenant_id = :tenant AND k.idem_key = :key
                 """.trimIndent(),
-            ).param("id", id)
-            .param("tenant", tenantId)
-            .param("subject", subjectId)
-            .param("probe", probe)
-            .update()
-        return id
-    }
+            ).param("tenant", tenantId)
+            .param("key", idempotencyKey)
+            .query { rs, _ -> KeyRecord(rs.getBytes("fingerprint"), rs.getObject("id", UUID::class.java), rs.getString("status")) }
+            .optional()
+            .orElse(null)
 
     /** Tenant-scoped read: another tenant's id behaves exactly like an unknown one (brief L36). The probe is never read. */
     fun find(
