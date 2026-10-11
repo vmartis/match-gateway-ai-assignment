@@ -19,8 +19,14 @@ import org.testcontainers.rabbitmq.RabbitMQContainer
 import tools.jackson.databind.JsonNode
 import tools.jackson.databind.json.JsonMapper
 
-/** Step 11 / D-28, AC-1 + AC-2: the matcher declares the same topology and reports broker readiness on its port. */
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+/**
+ * Step 11 / D-28, AC-1 + AC-2: the matcher declares the same topology and reports broker readiness on its port.
+ * The listeners are not started: this test receives from the queues itself and must not have messages stolen.
+ */
+@SpringBootTest(
+    webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
+    properties = ["spring.rabbitmq.listener.simple.auto-startup=false"],
+)
 @Import(TestcontainersConfiguration::class)
 @ExtendWith(OutputCaptureExtension::class)
 class BrokerTopologyIT {

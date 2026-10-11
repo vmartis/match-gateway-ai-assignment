@@ -1,226 +1,136 @@
 package com.vmartis.matchgateway.matcher.decision
 
+import com.vmartis.matchgateway.common.messaging.Topology
 import com.vmartis.matchgateway.common.template.Cosine
+import com.vmartis.matchgateway.matcher.MatcherFixtures
 import com.vmartis.matchgateway.matcher.TestcontainersConfiguration
-import com.vmartis.matchgateway.matcher.decision.domain.Decision
-import com.vmartis.matchgateway.matcher.decision.domain.Outcome
-import com.vmartis.matchgateway.matcher.decision.infra.JobQueue
-import com.vmartis.matchgateway.matcher.decision.infra.MatcherWorker
+import com.vmartis.matchgateway.matcher.Vectors.bytes
+import com.vmartis.matchgateway.matcher.Vectors.reference
+import com.vmartis.matchgateway.matcher.Vectors.unit
+import com.vmartis.matchgateway.matcher.decision.infra.DecisionProcessor
 import io.micrometer.core.instrument.MeterRegistry
 import org.assertj.core.api.Assertions.assertThat
-import org.flywaydb.core.Flyway
+import org.assertj.core.data.Offset
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import org.springframework.amqp.rabbit.core.RabbitAdmin
+import org.springframework.amqp.rabbit.core.RabbitTemplate
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.boot.test.context.SpringBootTest
 import org.springframework.context.annotation.Import
 import org.springframework.jdbc.core.simple.JdbcClient
-import java.io.File
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
-import java.util.Random
+import org.testcontainers.rabbitmq.RabbitMQContainer
 import java.util.UUID
 import javax.sql.DataSource
-import kotlin.math.sqrt
 
-/** AC-24..AC-29, AC-17, INV-4, INV-5: the matcher decides pending verifications from the shared database. */
+/**
+ * AC-24..AC-29, AC-17, INV-4, INV-5 (D-28, ADR-009): the matcher consumes job messages from RabbitMQ and decides the pending
+ * verifications in the shared database. The listeners are running; the processing deadline is the 30 s maximum so that the
+ * crash test can hold a decision blocked without it timing out (the stall test lives in [MatcherStallIT]).
+ */
 @SpringBootTest(
     webEnvironment = SpringBootTest.WebEnvironment.NONE,
-    properties = ["matcher.scheduling.enabled=false"],
+    properties = ["matcher.processing-deadline=30s"],
 )
 @Import(TestcontainersConfiguration::class)
 class MatcherIT {
+    @Autowired
+    lateinit var listeners: org.springframework.amqp.rabbit.listener.RabbitListenerEndpointRegistry
+
+    @Autowired
+    lateinit var connectionFactory: org.springframework.amqp.rabbit.connection.CachingConnectionFactory
+
     @Autowired lateinit var jdbc: JdbcClient
 
     @Autowired lateinit var dataSource: DataSource
 
-    @Autowired lateinit var worker: MatcherWorker
+    @Autowired lateinit var rabbit: RabbitTemplate
 
-    @Autowired lateinit var queue: JobQueue
+    @Autowired lateinit var admin: RabbitAdmin
 
     @Autowired lateinit var meters: MeterRegistry
 
+    @Autowired lateinit var broker: RabbitMQContainer
+
+    @Autowired lateinit var processor: DecisionProcessor
+
+    private lateinit var fx: MatcherFixtures
+
     @BeforeEach
     fun setUp() {
-        val migrations = File("../gateway/src/main/resources/db/migration").absoluteFile.normalize()
-        Flyway
-            .configure()
-            .dataSource(dataSource)
-            .locations("filesystem:$migrations")
-            .load()
-            .migrate()
-        jdbc.sql("truncate verification, idempotency_key, template_version, subject, tenant_settings cascade").update()
+        fx = MatcherFixtures(jdbc, dataSource, rabbit, admin, meters, broker)
+        fx.reset()
     }
 
-    private fun bytes(floats: FloatArray): ByteArray {
-        val buf = ByteBuffer.allocate(floats.size * 4).order(ByteOrder.LITTLE_ENDIAN)
-        floats.forEach { buf.putFloat(it) }
-        return buf.array()
-    }
-
-    private fun unit(seed: Long): FloatArray {
-        val r = Random(seed)
-        val v = DoubleArray(128) { r.nextGaussian() }
-        val n = sqrt(v.sumOf { it * it })
-        return FloatArray(128) { (v[it] / n).toFloat() }
-    }
-
-    private fun reference(
-        a: FloatArray,
-        b: FloatArray,
-    ): Double {
-        var dot = 0.0
-        var na = 0.0
-        var nb = 0.0
-        for (i in a.indices) {
-            dot += a[i].toDouble() * b[i].toDouble()
-            na += a[i].toDouble() * a[i].toDouble()
-            nb += b[i].toDouble() * b[i].toDouble()
-        }
-        return dot / (sqrt(na) * sqrt(nb))
-    }
-
-    private fun enrol(
-        tenant: String,
-        subject: String,
-        template: ByteArray,
-    ) {
-        jdbc
-            .sql("insert into subject (tenant_id, subject_id, last_version) values (:t, :s, 1)")
-            .param("t", tenant)
-            .param("s", subject)
-            .update()
-        jdbc
-            .sql("insert into template_version (tenant_id, subject_id, version, template, active) values (:t, :s, 1, :b, true)")
-            .param("t", tenant)
-            .param("s", subject)
-            .param("b", template)
-            .update()
-    }
-
-    private fun pending(
-        tenant: String,
-        subject: String,
-        probe: ByteArray,
-    ): UUID {
-        val id = UUID.randomUUID()
-        jdbc
-            .sql("insert into verification (id, tenant_id, subject_id, status, probe) values (:id, :t, :s, 'PENDING', :p)")
-            .param("id", id)
-            .param("t", tenant)
-            .param("s", subject)
-            .param("p", probe)
-            .update()
-        return id
-    }
-
-    private data class Row(
-        val status: String,
-        val score: Double?,
-        val threshold: Double?,
-        val reason: String?,
-        val attempts: Int,
-        val probeNull: Boolean,
-        val leaseNull: Boolean,
-        val decided: Boolean,
-    )
-
-    private fun row(id: UUID): Row =
-        jdbc
-            .sql(
-                "select status, score, threshold, reason, attempts, probe is null as pn, " +
-                    "(lease_token is null and lease_until is null) as ln, decided_at is not null as d " +
-                    "from verification where id = :id",
-            ).param("id", id)
-            .query { rs, _ ->
-                Row(
-                    rs.getString("status"),
-                    rs.getObject("score") as Double?,
-                    rs.getObject("threshold") as Double?,
-                    rs.getString("reason"),
-                    rs.getInt("attempts"),
-                    rs.getBoolean("pn"),
-                    rs.getBoolean("ln"),
-                    rs.getBoolean("d"),
-                )
-            }.single()
-
-    private fun expireLease(id: UUID) {
-        jdbc
-            .sql("update verification set lease_until = now() - interval '1 second' where id = :id")
-            .param("id", id)
-            .update()
-    }
-
-    private fun counter(result: String): Double =
-        meters
-            .find("matchgw.verifications.decided")
-            .tag("result", result)
-            .counter()
-            ?.count() ?: 0.0
+    private fun within1e5() = Offset.offset(1e-5)
 
     @Test
-    fun `AC-24 enrolled pair is decided NO_MATCH or MATCH against threshold 0_5 with float64 score`() {
+    fun `AC-24 enrolled pair is decided MATCH or NO_MATCH against threshold 0_5 with a float64 score`() {
         val stored = unit(1)
-        val probeSame = unit(1)
-        val probeOther = unit(2)
-        enrol("t1", "s1", bytes(stored))
-        val same = pending("t1", "s1", bytes(probeSame))
-        val other = pending("t1", "s1", bytes(probeOther))
+        val same = unit(1)
+        val other = unit(2)
+        fx.enrol("t1", "s1", bytes(stored))
+        val matchId = fx.submit("t1", "s1", bytes(same))
+        val noMatchId = fx.submit("t1", "s1", bytes(other))
 
-        assertThat(worker.drain()).isEqualTo(2)
+        fx.awaitAllTerminal(listOf(matchId, noMatchId))
 
-        val a = row(same)
+        val a = fx.row(matchId)
         assertThat(a.status).isEqualTo("MATCH")
-        assertThat(a.score).isCloseTo(
-            reference(stored, probeSame),
-            org.assertj.core.data.Offset
-                .offset(1e-5),
-        )
+        assertThat(a.score).isCloseTo(reference(stored, same), within1e5())
         assertThat(a.threshold).isEqualTo(0.5)
         assertThat(a.decided).isTrue()
         assertThat(a.probeNull).isTrue()
-        assertThat(a.leaseNull).isTrue()
-        val expectedOther = reference(stored, probeOther)
-        val b = row(other)
-        assertThat(b.status).isEqualTo("NO_MATCH")
+        val expectedOther = reference(stored, other)
         assertThat(expectedOther).isLessThan(0.5)
-        assertThat(b.score).isCloseTo(
-            expectedOther,
-            org.assertj.core.data.Offset
-                .offset(1e-5),
-        )
+        val b = fx.row(noMatchId)
+        assertThat(b.status).isEqualTo("NO_MATCH")
+        assertThat(b.score).isCloseTo(expectedOther, within1e5())
+        assertThat(b.threshold).isEqualTo(0.5)
         assertThat(b.probeNull).isTrue()
     }
 
     @Test
-    fun `AC-24 score equal to threshold is a MATCH`() {
+    fun `AC-24 score equal to the threshold is a MATCH`() {
         val stored = unit(3)
         val probe = unit(4)
         val exact = Cosine.similarity(stored, probe)
-        enrol("t1", "s1", bytes(stored))
-        jdbc.sql("insert into tenant_settings (tenant_id, threshold) values ('t1', :t)").param("t", exact).update()
-        val id = pending("t1", "s1", bytes(probe))
+        fx.enrol("t1", "s1", bytes(stored))
+        fx.setThreshold("t1", exact)
+        val id = fx.submit("t1", "s1", bytes(probe))
 
-        worker.drain()
+        fx.awaitTerminal(id)
 
-        val r = row(id)
+        val r = fx.row(id)
         assertThat(r.status).isEqualTo("MATCH")
         assertThat(r.score).isEqualTo(exact)
         assertThat(r.threshold).isEqualTo(exact)
     }
 
     @Test
-    fun `AC-25 threshold changed before drain is used and stored`() {
-        val stored = unit(5)
-        val probe = unit(5)
-        enrol("t1", "s1", bytes(stored))
-        val id = pending("t1", "s1", bytes(probe))
-        jdbc.sql("insert into tenant_settings (tenant_id, threshold) values ('t1', 0.9)").update()
+    fun `AC-24 score just below the threshold is a NO_MATCH`() {
+        val stored = unit(3)
+        val probe = unit(4)
+        val exact = Cosine.similarity(stored, probe)
+        fx.enrol("t1", "s1", bytes(stored))
+        fx.setThreshold("t1", Math.nextUp(exact))
+        val id = fx.submit("t1", "s1", bytes(probe))
 
-        worker.drain()
+        fx.awaitTerminal(id)
 
-        val r = row(id)
+        assertThat(fx.row(id).status).isEqualTo("NO_MATCH")
+    }
+
+    @Test
+    fun `AC-25 threshold changed before the message is processed is used and stored`() {
+        fx.enrol("t1", "s1", bytes(unit(5)))
+        val id = fx.pending("t1", "s1", bytes(unit(5)))
+        fx.setThreshold("t1", 0.9) // changed after the POST, before the job is processed
+        fx.publish(id)
+
+        fx.awaitTerminal(id)
+
+        val r = fx.row(id)
         assertThat(r.threshold).isEqualTo(0.9)
         assertThat(r.status).isEqualTo("MATCH")
     }
@@ -228,229 +138,238 @@ class MatcherIT {
     @Test
     fun `AC-25 higher threshold turns a mid score into NO_MATCH`() {
         val stored = unit(6)
-        val probe = FloatArray(128) { 0.6f * stored[it] + 0.4f * unit(7)[it] }
-        val score = reference(stored, probe)
-        assertThat(score).isBetween(0.5, 0.9)
-        enrol("t1", "s1", bytes(stored))
-        jdbc.sql("insert into tenant_settings (tenant_id, threshold) values ('t1', 0.9)").update()
-        val id = pending("t1", "s1", bytes(probe))
+        val noise = unit(7)
+        val probe = FloatArray(128) { 0.6f * stored[it] + 0.4f * noise[it] }
+        assertThat(reference(stored, probe)).isBetween(0.5, 0.9)
+        fx.enrol("t1", "s1", bytes(stored))
+        fx.setThreshold("t1", 0.9)
+        val id = fx.submit("t1", "s1", bytes(probe))
 
-        worker.drain()
+        fx.awaitTerminal(id)
 
-        assertThat(row(id).status).isEqualTo("NO_MATCH")
-        assertThat(row(id).threshold).isEqualTo(0.9)
+        assertThat(fx.row(id).status).isEqualTo("NO_MATCH")
+        assertThat(fx.row(id).threshold).isEqualTo(0.9)
     }
 
     @Test
-    fun `AC-26 and AC-29 and AC-17 no active template fails SUBJECT_NOT_ENROLLED without retry and clears probe`() {
-        val id = pending("t1", "ghost", bytes(unit(8)))
+    fun `AC-26 AC-29 AC-17 no active template fails SUBJECT_NOT_ENROLLED after exactly one delivery and clears the probe`() {
+        val processedBefore = fx.processingCount()
+        val failedBefore = fx.counter("FAILED")
+        val id = fx.submit("t1", "ghost", bytes(unit(8)))
 
-        worker.drain()
+        fx.awaitTerminal(id)
+        fx.awaitQueuesEmpty()
 
-        val r = row(id)
+        val r = fx.row(id)
         assertThat(r.status).isEqualTo("FAILED")
         assertThat(r.reason).isEqualTo("SUBJECT_NOT_ENROLLED")
-        assertThat(r.attempts).isEqualTo(1)
         assertThat(r.score).isNull()
+        assertThat(r.threshold).isNull()
         assertThat(r.probeNull).isTrue()
-        assertThat(r.leaseNull).isTrue()
         assertThat(r.decided).isTrue()
+        // no retry: one processing attempt, nothing dead-lettered
+        assertThat(fx.processingCount() - processedBefore).isEqualTo(1L)
+        fx.await("FAILED counter") { fx.counter("FAILED") - failedBefore == 1.0 }
     }
 
     @Test
-    fun `AC-27 corrupt stored template is retried three times then FAILED MAX_ATTEMPTS and never claimed again`() {
-        val corrupt = unit(9).also { it[10] = Float.NaN }
-        enrol("t1", "s1", bytes(corrupt))
-        val id = pending("t1", "s1", bytes(unit(9)))
+    fun `AC-27 corrupt stored template is delivered exactly 3 times then dead-lettered to FAILED MAX_ATTEMPTS and never processed again`() {
+        fx.enrol("t1", "s1", bytes(unit(9).also { it[10] = Float.NaN }))
+        val processedBefore = fx.processingCount()
+        val failedBefore = fx.counter("FAILED")
+        val id = fx.submit("t1", "s1", bytes(unit(9)))
 
-        for (expected in 1..3) {
-            worker.drain()
-            val r = row(id)
-            assertThat(r.status).isEqualTo("PENDING")
-            assertThat(r.attempts).isEqualTo(expected)
-            assertThat(r.leaseNull).isFalse()
-            expireLease(id)
-        }
-        worker.drain()
+        fx.awaitTerminal(id, 60)
+        fx.awaitQueuesEmpty()
 
-        val r = row(id)
+        val r = fx.row(id)
         assertThat(r.status).isEqualTo("FAILED")
         assertThat(r.reason).isEqualTo("MAX_ATTEMPTS")
-        assertThat(r.attempts).isEqualTo(3)
-        assertThat(r.probeNull).isTrue()
-        assertThat(r.leaseNull).isTrue()
-        assertThat(r.decided).isTrue()
-
-        assertThat(worker.drain()).isZero()
-        assertThat(row(id).attempts).isEqualTo(3)
-    }
-
-    @Test
-    fun `AC-27 probe with a non-finite value is a processing error counted as an attempt`() {
-        enrol("t1", "s1", bytes(unit(10)))
-        val badProbe = unit(10).also { it[0] = Float.POSITIVE_INFINITY }
-        val id = pending("t1", "s1", bytes(badProbe))
-
-        worker.drain()
-
-        val r = row(id)
-        assertThat(r.status).isEqualTo("PENDING")
-        assertThat(r.attempts).isEqualTo(1)
         assertThat(r.score).isNull()
+        assertThat(r.probeNull).isTrue()
+        assertThat(r.decided).isTrue()
+        assertThat(fx.processingCount() - processedBefore).isEqualTo(Topology.MAX_DELIVERIES.toLong())
+        fx.await("FAILED counter") { fx.counter("FAILED") - failedBefore == 1.0 }
+
+        // never processed again: neither a direct call nor a duplicate message changes anything
+        assertThat(processor.process(id)).isFalse()
+        fx.publish(id)
+        fx.awaitQueuesEmpty()
+        assertThat(fx.row(id)).isEqualTo(r)
+        assertThat(fx.counter("FAILED") - failedBefore).isEqualTo(1.0)
     }
 
     @Test
-    fun `AC-28 job claimed by a stalled worker is reclaimed after lease expiry`() {
-        enrol("t1", "s1", bytes(unit(11)))
-        val id = pending("t1", "s1", bytes(unit(11)))
-        val stalled = queue.claim(10)
-        assertThat(stalled).hasSize(1)
-        assertThat(stalled.single().id).isEqualTo(id)
-        assertThat(stalled.single().attempts).isEqualTo(1)
-        expireLease(id)
+    fun `AC-27 probe with a non-finite value is a processing error delivered 3 times then FAILED MAX_ATTEMPTS`() {
+        fx.enrol("t1", "s1", bytes(unit(10)))
+        val processedBefore = fx.processingCount()
+        val badProbe = unit(10).also { it[0] = Float.POSITIVE_INFINITY }
+        val id = fx.submit("t1", "s1", bytes(badProbe))
 
-        worker.drain()
+        fx.awaitTerminal(id, 60)
+        fx.awaitQueuesEmpty()
 
-        val r = row(id)
+        val r = fx.row(id)
+        assertThat(r.status).isEqualTo("FAILED")
+        assertThat(r.reason).isEqualTo("MAX_ATTEMPTS")
+        assertThat(r.score).isNull()
+        assertThat(r.probeNull).isTrue()
+        assertThat(fx.processingCount() - processedBefore).isEqualTo(3L)
+    }
+
+    @Test
+    fun `AC-28 a replica that crashes while holding the message - the job is redelivered and decided within 30 s`() {
+        fx.enrol("t1", "s1", bytes(unit(11)))
+        val id = fx.pending("t1", "s1", bytes(unit(11)))
+        val processedBefore = fx.processingCount()
+        val matchBefore = fx.counter("MATCH")
+
+        // The crashing replica is a separate process: a raw consumer that takes the job and never acks it. The app's own
+        // listeners are paused meanwhile, so the job is guaranteed to be held by the replica that crashes.
+        listeners.stop()
+        val crashed =
+            com.rabbitmq.client
+                .ConnectionFactory()
+                .apply {
+                    setUri(broker.amqpUrl)
+                    username = broker.adminUsername
+                    password = broker.adminPassword
+                }.newConnection()
+        val crashedAt: Long
+        try {
+            val received = java.util.concurrent.CountDownLatch(1)
+            crashed.createChannel().apply {
+                basicQos(1)
+                basicConsume(
+                    Topology.QUEUE,
+                    false,
+                    object : com.rabbitmq.client.DefaultConsumer(this) {
+                        override fun handleDelivery(
+                            consumerTag: String,
+                            envelope: com.rabbitmq.client.Envelope,
+                            properties: com.rabbitmq.client.AMQP.BasicProperties,
+                            body: ByteArray,
+                        ) = received.countDown() // holds the job, never acks
+                    },
+                )
+            }
+            fx.publish(id)
+            assertThat(received.await(10, java.util.concurrent.TimeUnit.SECONDS)).isTrue()
+        } catch (e: Throwable) {
+            crashed.abort() // a failed setup must not leave a consumer behind in the shared cached context
+            throw e
+        } finally {
+            listeners.start() // never leave the cached context without listeners
+        }
+        crashedAt = System.nanoTime()
+        crashed.abort() // the replica dies: no ack, connection gone → the broker redelivers
+
+        fx.awaitTerminal(id, 30)
+        assertThat(System.nanoTime() - crashedAt).isLessThan(30_000_000_000L)
+        val r = fx.row(id)
         assertThat(r.status).isEqualTo("MATCH")
-        assertThat(r.attempts).isEqualTo(2)
-        // the stalled worker is now stale: its terminal write must affect nothing
-        assertThat(
-            queue.complete(
-                stalled.single(),
-                com.vmartis.matchgateway.matcher.decision.domain.Outcome
-                    .Failed("MAX_ATTEMPTS"),
-            ),
-        ).isNull()
-        assertThat(row(id).status).isEqualTo("MATCH")
+        assertThat(r.probeNull).isTrue()
+        fx.awaitQueuesEmpty()
+        // decided exactly once, by the healthy replica
+        assertThat(fx.processingCount() - processedBefore).isEqualTo(1L)
+        assertThat(fx.counter("MATCH") - matchBefore).isEqualTo(1.0)
     }
 
     @Test
-    fun `INV-1 a worker that lost its lease cannot write while the new holder is still deciding`() {
-        // Pins the lease-token guard on its own: the row is still PENDING (status guard alone would let A write).
-        enrol("t1", "s1", bytes(unit(14)))
-        val id = pending("t1", "s1", bytes(unit(14)))
-        val a = queue.claim(10).single()
-        expireLease(id)
-        val b = queue.claim(10).single()
+    fun `AC-28 a consumer stuck on one job does not hold up other jobs (prefetch 1)`() {
+        fx.enrol("t1", "s1", bytes(unit(21)))
+        val stuck = fx.pending("t1", "s1", bytes(unit(21)))
+        dataSource.connection.use { lock ->
+            lock.autoCommit = false
+            // Only this job's terminal UPDATE blocks: its consumer is stuck holding this one message.
+            lock.prepareStatement("select id from verification where id = ? for update").use {
+                it.setObject(1, stuck)
+                it.executeQuery().close()
+            }
+            fx.publish(stuck)
+            fx.await("a consumer stuck on the locked job") {
+                jdbc
+                    .sql("select count(*) from pg_stat_activity where wait_event_type = 'Lock' and query like 'UPDATE verification%'")
+                    .query(Long::class.java)
+                    .single() == 1L
+            }
+            val others = (1..20).map { fx.pending("t1", "s1", bytes(unit(21))) }
+            others.forEach { fx.publish(it) }
 
-        assertThat(queue.complete(a, Outcome.Failed("MAX_ATTEMPTS"))).isNull()
-        assertThat(row(id).status).isEqualTo("PENDING")
-
-        assertThat(queue.complete(b, Decision.decide(0.9, 0.5))).isNotNull().isGreaterThanOrEqualTo(java.time.Duration.ZERO)
-        assertThat(row(id).status).isEqualTo("MATCH")
-    }
-
-    @Test
-    fun `AC-27 claim never takes a job that used all attempts even before the reaper ran`() {
-        // Replicas reap and claim independently, so claim itself must respect the cap (CHECK attempts BETWEEN 0 AND 3).
-        enrol("t1", "s1", bytes(unit(15)))
-        val id = pending("t1", "s1", bytes(unit(15)))
-        jdbc
-            .sql("update verification set attempts = 3, lease_until = now() - interval '1 second' where id = :id")
-            .param("id", id)
-            .update()
-
-        assertThat(queue.claim(10)).isEmpty()
-        assertThat(row(id).attempts).isEqualTo(3)
-    }
-
-    @Test
-    fun `AC-27 a failed attempt releases the lease for a retry after the 1 s delay instead of the 10 s lease`() {
-        enrol("t1", "s1", bytes(unit(16).also { it[3] = Float.NaN }))
-        val id = pending("t1", "s1", bytes(unit(16)))
-
-        worker.drain()
-
-        val released =
-            jdbc
-                .sql(
-                    "select lease_token is null as released, extract(epoch from lease_until - now()) as wait " +
-                        "from verification where id = :id",
-                ).param("id", id)
-                .query { rs, _ -> rs.getBoolean("released") to rs.getDouble("wait") }
-                .single()
-        assertThat(released.first).isTrue()
-        assertThat(released.second).isBetween(0.0, 2.0) // retry-delay 1 s, far below the 10 s lease
-    }
-
-    @Test
-    fun `INV-1 a stale release cannot drop the new holder's lease`() {
-        enrol("t1", "s1", bytes(unit(17)))
-        val id = pending("t1", "s1", bytes(unit(17)))
-        val a = queue.claim(10).single()
-        expireLease(id)
-        val b = queue.claim(10).single()
-
-        queue.release(a)
-
-        val token =
-            jdbc
-                .sql("select lease_token from verification where id = :id")
-                .param("id", id)
-                .query(java.util.UUID::class.java)
-                .single()
-        assertThat(token).isEqualTo(b.leaseToken)
-    }
-
-    @Test
-    fun `AC-28 claim does not take a job whose lease is still valid`() {
-        enrol("t1", "s1", bytes(unit(12)))
-        pending("t1", "s1", bytes(unit(12)))
-        assertThat(queue.claim(10)).hasSize(1)
-        assertThat(queue.claim(10)).isEmpty()
+            // The other consumers take them all; none waits behind the stuck job until the 30 s deadline.
+            others.forEach { fx.awaitTerminal(it, 10) }
+            lock.rollback()
+        }
+        fx.awaitTerminal(stuck, 30)
     }
 
     @Test
     fun `INV-4 template of another tenant with the same subject id is never used`() {
-        enrol("other", "s1", bytes(unit(13)))
-        val id = pending("t1", "s1", bytes(unit(13)))
+        fx.enrol("other", "s1", bytes(unit(13)))
+        val id = fx.submit("t1", "s1", bytes(unit(13)))
 
-        worker.drain()
+        fx.awaitTerminal(id)
 
-        val r = row(id)
+        val r = fx.row(id)
         assertThat(r.status).isEqualTo("FAILED")
         assertThat(r.reason).isEqualTo("SUBJECT_NOT_ENROLLED")
     }
 
     @Test
-    fun `result counter is incremented once per decided verification`() {
-        enrol("t1", "s1", bytes(unit(14)))
-        pending("t1", "s1", bytes(unit(14)))
-        val before = counter("MATCH")
+    fun `result counter and latency timer are incremented once per decided verification`() {
+        fx.enrol("t1", "s1", bytes(unit(14)))
+        val matchBefore = fx.counter("MATCH")
+        val latencyBefore = fx.latencyCount()
+        val id = fx.submit("t1", "s1", bytes(unit(14)))
 
-        worker.drain()
+        fx.awaitTerminal(id)
+        fx.awaitQueuesEmpty()
 
-        assertThat(counter("MATCH") - before).isEqualTo(1.0)
+        fx.await("MATCH counter") { fx.counter("MATCH") - matchBefore == 1.0 }
+        fx.await("latency sample") { fx.latencyCount() - latencyBefore == 1L }
     }
 
     @Test
-    fun `reaper counts MAX_ATTEMPTS failures as FAILED results`() {
-        val id = pending("t1", "s1", bytes(unit(15)))
-        jdbc
-            .sql("update verification set attempts = 3, lease_until = now() - interval '1 second' where id = :id")
-            .param("id", id)
-            .update()
-        val before = counter("FAILED")
+    fun `a message for an unknown verification id is acked without effect and neither redelivered nor dead-lettered`() {
+        val before = fx.counters()
+        val latencyBefore = fx.latencyCount()
+        val processedBefore = fx.processingCount()
 
-        worker.drain()
+        fx.publish(UUID.randomUUID())
+        fx.await("the message to be processed") { fx.processingCount() - processedBefore >= 1 }
+        fx.awaitQueuesEmpty()
 
-        assertThat(row(id).reason).isEqualTo("MAX_ATTEMPTS")
-        assertThat(counter("FAILED") - before).isEqualTo(1.0)
+        assertThat(fx.processingCount() - processedBefore).isEqualTo(1L) // delivered once, acked
+        assertThat(fx.counters()).isEqualTo(before)
+        assertThat(fx.latencyCount()).isEqualTo(latencyBefore)
+        assertThat(fx.count("select count(*) from verification")).isZero()
     }
 
     @Test
-    fun `drain on an empty table returns 0`() {
-        assertThat(worker.drain()).isZero()
-    }
+    fun `a message whose body is not a canonical UUID is acked and dropped without processing, redelivery or dead-lettering`() {
+        val poison =
+            listOf(
+                "not-a-uuid",
+                "",
+                "1-1-1-1-1", // accepted by UUID.fromString, but not canonical
+                """{"id":"${UUID.randomUUID()}"}""",
+                " ${UUID.randomUUID()}",
+                "${UUID.randomUUID()}\n",
+                "A".repeat(10_000),
+            )
+        val before = fx.counters()
+        val processedBefore = fx.processingCount()
 
-    @Test
-    fun `drain processes more rows than one batch`() {
-        enrol("t1", "s1", bytes(unit(16)))
-        val ids = (1..45).map { pending("t1", "s1", bytes(unit(16))) }
+        poison.forEach { fx.publishRaw(it.toByteArray()) }
+        fx.awaitQueuesEmpty()
+        // A valid sentinel proves the consumers are alive and nothing poisonous comes back around.
+        fx.enrol("t1", "s1", bytes(unit(20)))
+        val sentinel = fx.submit("t1", "s1", bytes(unit(20)))
+        fx.awaitTerminal(sentinel)
+        fx.awaitQueuesEmpty()
 
-        assertThat(worker.drain()).isEqualTo(45)
-
-        ids.forEach { assertThat(row(it).status).isEqualTo("MATCH") }
+        assertThat(fx.processingCount() - processedBefore).isEqualTo(1L) // the sentinel only
+        assertThat(fx.counters().getValue("FAILED")).isEqualTo(before.getValue("FAILED"))
+        assertThat(fx.queueMessages(Topology.DEAD_LETTER_QUEUE)).isZero()
     }
 }

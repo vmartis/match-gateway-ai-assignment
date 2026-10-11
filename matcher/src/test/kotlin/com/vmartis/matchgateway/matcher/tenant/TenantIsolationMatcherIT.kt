@@ -1,20 +1,22 @@
 package com.vmartis.matchgateway.matcher.tenant
 
+import com.vmartis.matchgateway.matcher.MatcherFixtures
 import com.vmartis.matchgateway.matcher.TestcontainersConfiguration
-import com.vmartis.matchgateway.matcher.decision.infra.MatcherWorker
+import io.micrometer.core.instrument.MeterRegistry
 import org.assertj.core.api.Assertions.assertThat
-import org.flywaydb.core.Flyway
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.extension.ExtendWith
+import org.springframework.amqp.rabbit.core.RabbitAdmin
+import org.springframework.amqp.rabbit.core.RabbitTemplate
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.boot.test.context.SpringBootTest
 import org.springframework.boot.test.system.CapturedOutput
 import org.springframework.boot.test.system.OutputCaptureExtension
 import org.springframework.context.annotation.Import
 import org.springframework.jdbc.core.simple.JdbcClient
-import java.io.File
+import org.testcontainers.rabbitmq.RabbitMQContainer
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.Base64
@@ -29,7 +31,7 @@ import kotlin.math.sqrt
  */
 @SpringBootTest(
     webEnvironment = SpringBootTest.WebEnvironment.NONE,
-    properties = ["matcher.scheduling.enabled=false", "logging.level.com.vmartis=DEBUG"],
+    properties = ["logging.level.com.vmartis=DEBUG"],
 )
 @Import(TestcontainersConfiguration::class)
 @ExtendWith(OutputCaptureExtension::class)
@@ -38,18 +40,26 @@ class TenantIsolationMatcherIT {
 
     @Autowired lateinit var dataSource: DataSource
 
-    @Autowired lateinit var worker: MatcherWorker
+    @Autowired lateinit var rabbit: RabbitTemplate
+
+    @Autowired lateinit var admin: RabbitAdmin
+
+    @Autowired lateinit var meters: MeterRegistry
+
+    @Autowired lateinit var broker: RabbitMQContainer
+
+    private lateinit var fx: MatcherFixtures
 
     @BeforeEach
     fun setUp() {
-        val migrations = File("../gateway/src/main/resources/db/migration").absoluteFile.normalize()
-        Flyway
-            .configure()
-            .dataSource(dataSource)
-            .locations("filesystem:$migrations")
-            .load()
-            .migrate()
-        jdbc.sql("truncate verification, idempotency_key, template_version, subject, tenant_settings cascade").update()
+        fx = MatcherFixtures(jdbc, dataSource, rabbit, admin, meters, broker)
+        fx.reset()
+    }
+
+    /** Publishes the job messages (as the gateway does) and waits until the listener has decided all of them. */
+    private fun decide(vararg ids: UUID) {
+        ids.forEach(fx::publish)
+        fx.awaitAllTerminal(ids.toList(), 60)
     }
 
     private fun bytes(floats: FloatArray): ByteArray {
@@ -129,12 +139,11 @@ class TenantIsolationMatcherIT {
         val score: Double?,
         val threshold: Double?,
         val reason: String?,
-        val attempts: Int,
     )
 
     private fun row(id: UUID): Row =
         jdbc
-            .sql("select status, score, threshold, reason, attempts from verification where id = :id")
+            .sql("select status, score, threshold, reason from verification where id = :id")
             .param("id", id)
             .query { rs, _ ->
                 Row(
@@ -142,16 +151,8 @@ class TenantIsolationMatcherIT {
                     rs.getObject("score") as Double?,
                     rs.getObject("threshold") as Double?,
                     rs.getString("reason"),
-                    rs.getInt("attempts"),
                 )
             }.single()
-
-    private fun expireLease(id: UUID) {
-        jdbc
-            .sql("update verification set lease_until = now() - interval '1 second' where id = :id")
-            .param("id", id)
-            .update()
-    }
 
     private fun storedTemplates(tenant: String): List<List<Byte>> =
         jdbc
@@ -171,7 +172,7 @@ class TenantIsolationMatcherIT {
         val b = pending("tenant-b", "s1", bytes(x))
         val aTemplates = storedTemplates("tenant-a")
 
-        worker.drain()
+        decide(aOwn, b)
 
         val r = row(b)
         assertThat(r.status).isEqualTo("FAILED")
@@ -193,7 +194,7 @@ class TenantIsolationMatcherIT {
         val withA = pending("tenant-b", "s1", bytes(a))
         val withOwn = pending("tenant-b", "s1", bytes(bOwn))
 
-        worker.drain()
+        decide(withA, withOwn)
 
         assertThat(row(withOwn).status).isEqualTo("MATCH")
         val r = row(withA)
@@ -212,7 +213,7 @@ class TenantIsolationMatcherIT {
         val a = pending("tenant-a", "s1", bytes(cosine06()))
         val b = pending("tenant-b", "s1", bytes(cosine06()))
 
-        worker.drain()
+        decide(a, b)
 
         val ra = row(a)
         assertThat(ra.status).isEqualTo("NO_MATCH")
@@ -228,7 +229,7 @@ class TenantIsolationMatcherIT {
     fun `AC-40 a threshold of tenant A set after B's verification was decided does not alter B's decided row`() {
         enrol("tenant-b", "s1", bytes(axis()))
         val b = pending("tenant-b", "s1", bytes(cosine06()))
-        worker.drain()
+        decide(b)
         val before = row(b)
 
         setThreshold("tenant-a", 0.99)
@@ -243,11 +244,11 @@ class TenantIsolationMatcherIT {
         enrol("tenant-a", "s1", bytes(axis()))
         setThreshold("tenant-a", 0.7)
         val first = pending("tenant-a", "s1", bytes(cosine06()))
-        worker.drain()
+        decide(first)
 
         setThreshold("tenant-a", 0.55)
         val second = pending("tenant-a", "s1", bytes(cosine06()))
-        worker.drain()
+        decide(second)
 
         assertThat(row(first).status).isEqualTo("NO_MATCH")
         assertThat(row(first).threshold).isEqualTo(0.7)
@@ -264,7 +265,7 @@ class TenantIsolationMatcherIT {
         val a = pending("tenant-a", "s1", bytes(cosine06()))
         val b = pending("tenant-b", "s1", bytes(cosine06()))
 
-        worker.drain()
+        decide(a, b)
 
         assertThat(row(a).status).isEqualTo("MATCH")
         assertThat(row(a).threshold).isEqualTo(0.0)
@@ -292,22 +293,15 @@ class TenantIsolationMatcherIT {
         val poison = pending("tenant-a", "s1", bytes(poisonProbe))
         val corrupt = pending("tenant-a", "corrupt", bytes(corruptProbe))
 
-        worker.drain()
-        repeat(2) {
-            expireLease(poison)
-            expireLease(corrupt)
-            worker.drain()
-        }
-        expireLease(poison)
-        expireLease(corrupt)
-        worker.drain()
+        decide(success, notEnrolled)
+        decide(poison, corrupt) // 3 deliveries each, then the dead-letter consumer ends them
+        fx.awaitQueuesEmpty()
 
         // the interesting paths really ran
         assertThat(row(success).status).isEqualTo("MATCH")
         assertThat(row(notEnrolled).reason).isEqualTo("SUBJECT_NOT_ENROLLED")
         assertThat(row(poison).reason).isEqualTo("MAX_ATTEMPTS")
         assertThat(row(corrupt).reason).isEqualTo("MAX_ATTEMPTS")
-        assertThat(output.all).contains("failed")
         val vectors = listOf(enrolled, okProbe, strangerProbe, poisonProbe, corruptStored, corruptProbe)
         vectors.map(::b64).forEach { s ->
             assertThat(output.all).doesNotContain(s)
@@ -319,5 +313,7 @@ class TenantIsolationMatcherIT {
             assertThat(output.all).doesNotContain(bytes(v).copyOfRange(0, 8).toHexString())
         }
         assertThat(output.all).doesNotContain("Bearer ")
+        // Guard that the failing paths really logged, so the scan above covered them (restored, code review step 13).
+        assertThat(output.all).contains("attempt failed")
     }
 }

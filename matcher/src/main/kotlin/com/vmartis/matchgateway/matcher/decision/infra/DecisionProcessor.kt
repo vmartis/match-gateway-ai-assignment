@@ -7,51 +7,63 @@ import com.vmartis.matchgateway.matcher.decision.domain.Job
 import com.vmartis.matchgateway.matcher.decision.domain.Outcome
 import io.micrometer.core.instrument.MeterRegistry
 import io.micrometer.core.instrument.Timer
-import org.slf4j.LoggerFactory
 import org.springframework.jdbc.core.simple.JdbcClient
 import org.springframework.stereotype.Component
+import org.springframework.transaction.PlatformTransactionManager
 import org.springframework.transaction.support.TransactionTemplate
+import java.time.Duration
+import java.util.UUID
 
-/** Decides claimed verifications. Each job is decided and written in one transaction; errors release the lease. */
+/**
+ * Decides one verification per message (ADR-009). Decision and guarded write share one transaction whose timeout is the
+ * processing deadline (Spring applies it as JDBC query timeouts), so a stall ends in an exception and a redelivery.
+ */
 @Component
-class MatcherWorker(
+class DecisionProcessor(
     private val queue: JobQueue,
     private val jdbc: JdbcClient,
-    private val properties: MatcherProperties,
-    private val transactions: TransactionTemplate,
     private val meters: MeterRegistry,
+    transactionManager: PlatformTransactionManager,
+    properties: MatcherProperties,
 ) {
+    private val transactions =
+        TransactionTemplate(transactionManager).apply { timeout = properties.processingDeadline.toSecondsCeil() }
+
     private val processing = Timer.builder("matchgw.matcher.processing").register(meters)
 
     // decidedAt − createdAt of each written outcome, as a histogram for server-side percentiles (AC-51, D-13).
     private val latency = Timer.builder("matchgw.verification.latency").publishPercentileHistogram().register(meters)
 
-    /** Reaps exhausted jobs, then claims and processes batches until a batch comes back short. Returns jobs processed. */
-    fun drain(): Int {
-        var processed = 0
-        do {
-            // Reap on every batch, not only at the start: under sustained load drain() may never return (reviews step 5).
-            decided("FAILED", queue.reap())
-            val batch = queue.claim(properties.batchSize)
-            batch.forEach { job -> processing.record(Runnable { process(job) }) }
-            processed += batch.size
-        } while (batch.size == properties.batchSize)
-        return processed
+    /** True iff this call wrote the outcome. Unknown or terminal ids are a no-op. Throws on processing errors (→ reject). */
+    fun process(id: UUID): Boolean {
+        val sample = Timer.start()
+        try {
+            val written =
+                transactions.execute { _ ->
+                    queue.load(id)?.let { job ->
+                        decide(job).let { o ->
+                            queue.complete(job, o)?.let {
+                                o to
+                                    it
+                            }
+                        }
+                    }
+                }
+            // Counted only after the commit, and only if this call wrote the one outcome (INV-1).
+            written?.let { (outcome, decidedAfter) ->
+                recordDecided(if (outcome is Outcome.Decided) outcome.status else "FAILED", decidedAfter)
+            }
+            return written != null
+        } finally {
+            sample.stop(processing)
+        }
     }
 
-    private fun process(job: Job) {
-        try {
-            // Counted only after the commit, and only if this claimant wrote the one outcome (INV-1).
-            val written = transactions.execute { decide(job).let { outcome -> queue.complete(job, outcome)?.let { outcome to it } } }
-            written?.let { (outcome, decidedAfter) ->
-                decided(if (outcome is Outcome.Decided) outcome.status else "FAILED")
-                latency.record(decidedAfter)
-            }
-        } catch (e: RuntimeException) {
-            // Only the job id and the exception class: messages may carry data (CLAUDE.md §4).
-            log.warn("Verification {} attempt {} failed: {}", job.id, job.attempts, e.javaClass.simpleName)
-            queue.release(job)
-        }
+    /** FAILED/MAX_ATTEMPTS for a dead-lettered job; true iff this call wrote it (AC-27). */
+    fun failMaxAttempts(id: UUID): Boolean {
+        val decidedAfter = transactions.execute { _ -> queue.failMaxAttempts(id) }
+        decidedAfter?.let { recordDecided("FAILED", it) }
+        return decidedAfter != null
     }
 
     private fun decide(job: Job): Outcome {
@@ -75,15 +87,17 @@ class MatcherWorker(
         return Decision.decide(score, threshold)
     }
 
-    private fun decided(
+    private fun recordDecided(
         result: String,
-        count: Int = 1,
+        decidedAfter: Duration,
     ) {
-        if (count > 0) meters.counter("matchgw.verifications.decided", "result", result).increment(count.toDouble())
+        meters.counter("matchgw.verifications.decided", "result", result).increment()
+        latency.record(decidedAfter)
     }
+
+    private fun Duration.toSecondsCeil(): Int = ((toMillis() + 999) / 1000).toInt()
 
     private companion object {
         const val DEFAULT_THRESHOLD = 0.5
-        val log = LoggerFactory.getLogger(MatcherWorker::class.java)
     }
 }

@@ -8,62 +8,29 @@ import java.time.Duration
 import java.util.UUID
 
 /**
- * PostgreSQL work queue (ADR-003). The DB clock is the only clock. Every claim is an attempt (A-2); the terminal write is
- * guarded by status = PENDING and the claimant's lease token, so a stale or duplicate writer changes 0 rows (INV-1).
+ * PostgreSQL side of a job (ADR-009): delivery is at-least-once, so every terminal write is guarded by status = PENDING
+ * and a duplicate, redelivered or late writer changes 0 rows (INV-1). The V2 trigger backs this up.
  */
 @Repository
 class JobQueue(
     private val jdbc: JdbcClient,
-    private val properties: MatcherProperties,
 ) {
-    fun claim(batch: Int): List<Job> {
-        val token = UUID.randomUUID()
-        return jdbc
-            .sql(
-                """
-                WITH next AS (
-                  SELECT id FROM verification
-                  WHERE status = 'PENDING' AND attempts < :maxAttempts AND (lease_until IS NULL OR lease_until < now())
-                  ORDER BY created_at
-                  LIMIT :batch
-                  FOR UPDATE SKIP LOCKED)
-                UPDATE verification v
-                   SET attempts = v.attempts + 1, lease_token = :token, lease_until = now() + make_interval(secs => :leaseSeconds)
-                  FROM next WHERE v.id = next.id
-                RETURNING v.id, v.tenant_id, v.subject_id, v.probe, v.attempts
-                """.trimIndent(),
-            ).param("maxAttempts", properties.maxAttempts)
-            .param("batch", batch)
-            .param("token", token)
-            .param("leaseSeconds", properties.lease.seconds())
-            .query { rs, _ ->
-                Job(
-                    id = rs.getObject("id", UUID::class.java),
-                    tenantId = rs.getString("tenant_id"),
-                    subjectId = rs.getString("subject_id"),
-                    probe = rs.getBytes("probe"),
-                    attempts = rs.getInt("attempts"),
-                    leaseToken = token,
-                )
-            }.list()
-    }
-
-    /** Ends jobs that used all attempts and whose last lease ran out (AC-27). Returns the number of rows failed. */
-    fun reap(): Int =
+    /** The pending verification, or null if unknown or already terminal (decided, erased, failed). */
+    fun load(id: UUID): Job? =
         jdbc
-            .sql(
-                """
-                UPDATE verification
-                   SET status = 'FAILED', reason = 'MAX_ATTEMPTS', probe = NULL, lease_token = NULL, lease_until = NULL,
-                       decided_at = now()
-                 WHERE status = 'PENDING' AND attempts >= :maxAttempts AND (lease_until IS NULL OR lease_until < now())
-                """.trimIndent(),
-            ).param("maxAttempts", properties.maxAttempts)
-            .update()
+            .sql("SELECT id, tenant_id, subject_id, probe FROM verification WHERE id = :id AND status = 'PENDING'")
+            .param("id", id)
+            .query {
+                rs,
+                _,
+                ->
+                Job(rs.getObject("id", UUID::class.java), rs.getString("tenant_id"), rs.getString("subject_id"), rs.getBytes("probe"))
+            }.optional()
+            .orElse(null)
 
     /**
-     * Writes the outcome iff this claimant still holds the lease (INV-1); the probe is dropped in the same statement (D-11).
-     * Returns decidedAt − createdAt when this claimant wrote the one and only outcome, null when the write changed 0 rows.
+     * Writes the outcome iff the verification is still pending; the probe is dropped in the same statement (D-11).
+     * Returns decidedAt − createdAt when this call wrote the one and only outcome, null when it changed 0 rows.
      */
     fun complete(
         job: Job,
@@ -74,43 +41,37 @@ class JobQueue(
                 is Outcome.Decided -> listOf(outcome.status, outcome.score, outcome.threshold, null)
                 is Outcome.Failed -> listOf("FAILED", null, null, outcome.reason)
             }
-        return jdbc
+        return terminal(job.id, status, score, threshold, reason)
+    }
+
+    /** FAILED/MAX_ATTEMPTS for a dead-lettered job (AC-27), same guard and return value as [complete]. */
+    fun failMaxAttempts(id: UUID): Duration? = terminal(id, "FAILED", null, null, "MAX_ATTEMPTS")
+
+    private fun terminal(
+        id: UUID,
+        status: Any?,
+        score: Any?,
+        threshold: Any?,
+        reason: Any?,
+    ): Duration? =
+        jdbc
             .sql(
                 """
                 UPDATE verification
-                   SET status = :status, score = :score, threshold = :threshold, reason = :reason,
-                       probe = NULL, lease_token = NULL, lease_until = NULL, decided_at = now()
-                 WHERE id = :id AND status = 'PENDING' AND lease_token = :token
+                   SET status = :status, score = :score, threshold = :threshold, reason = :reason, probe = NULL, decided_at = now()
+                 WHERE id = :id AND status = 'PENDING'
                 RETURNING EXTRACT(EPOCH FROM decided_at - created_at)
                 """.trimIndent(),
             ).param("status", status)
             .param("score", score)
             .param("threshold", threshold)
             .param("reason", reason)
-            .param("id", job.id)
-            .param("token", job.leaseToken)
+            .param("id", id)
             .query(Double::class.java)
             .optional()
             // decidedAt − createdAt from the one DB clock (AM-11), for the latency histogram (AC-51).
             .map { Duration.ofNanos((it * NANOS_PER_SECOND).toLong()) }
             .orElse(null)
-    }
-
-    /** Gives a failed attempt back after the retry delay (still guarded by the token). */
-    fun release(job: Job) {
-        jdbc
-            .sql(
-                """
-                UPDATE verification SET lease_token = NULL, lease_until = now() + make_interval(secs => :delaySeconds)
-                 WHERE id = :id AND status = 'PENDING' AND lease_token = :token
-                """.trimIndent(),
-            ).param("delaySeconds", properties.retryDelay.seconds())
-            .param("id", job.id)
-            .param("token", job.leaseToken)
-            .update()
-    }
-
-    private fun Duration.seconds(): Double = toMillis() / 1000.0
 
     private companion object {
         const val NANOS_PER_SECOND = 1_000_000_000.0

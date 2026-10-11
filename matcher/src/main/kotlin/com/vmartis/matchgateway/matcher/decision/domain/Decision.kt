@@ -23,12 +23,10 @@ object Decision {
     ): Outcome.Decided = Outcome.Decided(if (score >= threshold) "MATCH" else "NO_MATCH", score, threshold)
 }
 
-/** A claimed verification: the lease token proves ownership for the terminal write (ADR-003). */
+/** A pending verification to decide; the message carried only its id (ADR-009). */
 class Job(
     val id: UUID,
     val tenantId: String,
     val subjectId: String,
     val probe: ByteArray,
-    val attempts: Int,
-    val leaseToken: UUID,
 )

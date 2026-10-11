@@ -10,6 +10,15 @@ spring:
     port: 5672
     username: ${RABBITMQ_USER:matchgw}
     password: ${RABBITMQ_PASSWORD:}
+    # Manual ack after the DB commit; 3 consumers per replica (ADR-009, AC-34). Failures are rejected explicitly.
+    listener:
+      simple:
+        acknowledge-mode: manual
+        concurrency: 3
+        max-concurrency: 3
+        # One message per consumer: the held message is the one being processed, so a stalled consumer hoards no other
+        # jobs (NFR-6) and a connection loss returns only real attempts (A-2) – code review step 13.
+        prefetch: 1
   datasource:
     url: ${DB_URL:jdbc:postgresql://localhost:5432/matchgw}
     username: ${DB_USER:matchgw}
@@ -18,6 +27,11 @@ spring:
       data-source-properties:
         # PSQLException messages must never inline row values (probe bytes) – ARCHITECTURE T3.
         logServerErrorDetail: false
+        # Last resort for a frozen connection, where the query timeout's cancel cannot reach the server. Above the maximum
+        # processing deadline (30 s), so an ordinary lock wait still ends through the query timeout (code review step 13).
+        socketTimeout: 35
+      # Waiting for a pooled connection happens before the transaction timeout starts: keep it below the deadline.
+      connection-timeout: 5000
 
 # The matcher has no public API: only actuator, reachable inside the compose network (D-6).
 server:

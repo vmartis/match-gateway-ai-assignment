@@ -6,8 +6,9 @@ import org.junit.jupiter.api.Test
 import org.springframework.boot.context.properties.EnableConfigurationProperties
 import org.springframework.boot.test.context.runner.ApplicationContextRunner
 import java.time.Duration
+import kotlin.reflect.full.memberProperties
 
-/** AC-28: lease + poll interval must stay within the 30 s bound; startup fails otherwise. */
+/** AC-28: the processing deadline is > 0 and <= 30 s, startup fails otherwise (ADR-009). */
 class MatcherPropertiesTest {
     private val runner =
         ApplicationContextRunner().withUserConfiguration(PropsConfig::class.java)
@@ -16,59 +17,54 @@ class MatcherPropertiesTest {
     class PropsConfig
 
     @Test
-    fun `defaults satisfy the 30 second bound`() {
+    fun `defaults are a 10 second processing deadline and a 1 second dead letter retry delay`() {
         val p = MatcherProperties()
-        assertThat(p.lease).isEqualTo(Duration.ofSeconds(10))
-        assertThat(p.pollInterval).isEqualTo(Duration.ofMillis(200))
-        assertThat(p.batchSize).isEqualTo(20)
-        assertThat(p.retryDelay).isEqualTo(Duration.ofSeconds(1))
-        assertThat(p.maxAttempts).isEqualTo(3)
-        assertThat(p.lease.plus(p.pollInterval)).isLessThanOrEqualTo(Duration.ofSeconds(30))
+        assertThat(p.processingDeadline).isEqualTo(Duration.ofSeconds(10))
+        assertThat(p.deadLetterRetryDelay).isEqualTo(Duration.ofSeconds(1))
+        assertThat(p.processingDeadline).isLessThanOrEqualTo(Duration.ofSeconds(30))
     }
 
     @Test
-    fun `context starts with defaults`() {
-        runner.run { ctx -> assertThat(ctx).hasNotFailed() }
+    fun `the polling queue properties are gone`() {
+        assertThat(MatcherProperties::class.memberProperties.map { it.name })
+            .containsExactlyInAnyOrder("processingDeadline", "deadLetterRetryDelay")
     }
 
     @Test
-    fun `context starts at exactly the 30 second boundary`() {
-        runner.withPropertyValues("matcher.lease=29s", "matcher.poll-interval=1s").run { ctx ->
+    fun `context starts with defaults and binds the configured values`() {
+        runner.run { ctx ->
             assertThat(ctx).hasNotFailed()
+            assertThat(ctx.getBean(MatcherProperties::class.java).processingDeadline).isEqualTo(Duration.ofSeconds(10))
+        }
+        runner.withPropertyValues("matcher.processing-deadline=2s", "matcher.dead-letter-retry-delay=250ms").run { ctx ->
+            assertThat(ctx).hasNotFailed()
+            val p = ctx.getBean(MatcherProperties::class.java)
+            assertThat(p.processingDeadline).isEqualTo(Duration.ofSeconds(2))
+            assertThat(p.deadLetterRetryDelay).isEqualTo(Duration.ofMillis(250))
         }
     }
 
     @Test
-    fun `context fails when lease plus poll interval exceeds 30 seconds`() {
-        runner.withPropertyValues("matcher.lease=30s", "matcher.poll-interval=1s").run { ctx ->
-            assertThat(ctx).hasFailed()
-        }
+    fun `context starts at exactly the 30 second boundary and at 1 millisecond`() {
+        runner.withPropertyValues("matcher.processing-deadline=30s").run { ctx -> assertThat(ctx).hasNotFailed() }
+        runner.withPropertyValues("matcher.processing-deadline=1ms").run { ctx -> assertThat(ctx).hasNotFailed() }
     }
 
     @Test
-    fun `context fails when batch size is 0 or 101`() {
-        runner.withPropertyValues("matcher.batch-size=0").run { ctx -> assertThat(ctx).hasFailed() }
-        runner.withPropertyValues("matcher.batch-size=101").run { ctx -> assertThat(ctx).hasFailed() }
+    fun `context fails when the processing deadline exceeds 30 seconds`() {
+        runner.withPropertyValues("matcher.processing-deadline=30001ms").run { ctx -> assertThat(ctx).hasFailed() }
+        runner.withPropertyValues("matcher.processing-deadline=31s").run { ctx -> assertThat(ctx).hasFailed() }
     }
 
     @Test
-    fun `context fails when max attempts exceeds the schema cap of 3 or is 0`() {
-        runner.withPropertyValues("matcher.max-attempts=4").run { ctx -> assertThat(ctx).hasFailed() }
-        runner.withPropertyValues("matcher.max-attempts=0").run { ctx -> assertThat(ctx).hasFailed() }
-        runner.withPropertyValues("matcher.max-attempts=3").run { ctx -> assertThat(ctx).hasNotFailed() }
+    fun `context fails when the processing deadline is zero or negative`() {
+        runner.withPropertyValues("matcher.processing-deadline=0s").run { ctx -> assertThat(ctx).hasFailed() }
+        runner.withPropertyValues("matcher.processing-deadline=-1s").run { ctx -> assertThat(ctx).hasFailed() }
     }
 
     @Test
-    fun `context fails for a non-positive lease or poll interval or a negative retry delay`() {
-        runner.withPropertyValues("matcher.lease=0s").run { ctx -> assertThat(ctx).hasFailed() }
-        runner.withPropertyValues("matcher.poll-interval=0ms").run { ctx -> assertThat(ctx).hasFailed() }
-        runner.withPropertyValues("matcher.retry-delay=-1s").run { ctx -> assertThat(ctx).hasFailed() }
-        runner.withPropertyValues("matcher.retry-delay=0s").run { ctx -> assertThat(ctx).hasNotFailed() }
-    }
-
-    @Test
-    fun `context starts at batch size boundaries 1 and 100`() {
-        runner.withPropertyValues("matcher.batch-size=1").run { ctx -> assertThat(ctx).hasNotFailed() }
-        runner.withPropertyValues("matcher.batch-size=100").run { ctx -> assertThat(ctx).hasNotFailed() }
+    fun `dead letter retry delay accepts 0 and fails when negative`() {
+        runner.withPropertyValues("matcher.dead-letter-retry-delay=0s").run { ctx -> assertThat(ctx).hasNotFailed() }
+        runner.withPropertyValues("matcher.dead-letter-retry-delay=-1ms").run { ctx -> assertThat(ctx).hasFailed() }
     }
 }

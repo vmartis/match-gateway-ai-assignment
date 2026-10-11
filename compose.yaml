@@ -80,6 +80,7 @@ services:
           echo 'default_user = matchgw'
           echo "default_pass = $$(cat /creds/RABBITMQ_PASSWORD)"
           echo 'default_user_tags.administrator = false'
+          echo 'max_message_size = 4096' # jobs are 36-byte ids; caps hostile payloads (security review step 13)
         } > /conf/90-matchgw.conf
         chown 999:999 /conf/90-matchgw.conf
         chmod 0400 /conf/90-matchgw.conf

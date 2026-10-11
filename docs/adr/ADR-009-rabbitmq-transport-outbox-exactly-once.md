@@ -66,3 +66,10 @@
 - (−) NFR-6 for a stalled-but-connected worker depends on the matcher's own deadline, not on the broker.
 - (−) A-2 changes meaning: a redelivery after a crash counts as one of the 3 attempts (delivery count), as the lease expiry did.
 - Requires SPEC changes (transport line, AC-27, AC-28, AC-34..AC-36, A-2, NFR-6/7) – proposed in docs/SPEC.draft.md.
+- (step 13) Consumers use prefetch 1: the held message is the one being processed, so a stalled consumer hoards no other
+  jobs and a connection loss returns only jobs that were really attempted. A processing error requeues at once (no backoff):
+  a transient error (deadlock, failover blip) can use all 3 deliveries within milliseconds – the old 1 s retry delay of the
+  DB queue is gone. The processing deadline bounds the transaction's statements; connection acquisition (Hikari 5 s) and a
+  frozen socket (pgJDBC socketTimeout 35 s, above the 30 s maximum deadline) are bounded separately; the commit itself is not.
+- (step 13) A message lost after its publish was confirmed (queue purged, broker volume lost) leaves its verification
+  PENDING with its probe: there is no reconciler re-publishing old PENDING rows (README Known limitations).

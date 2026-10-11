@@ -1,7 +1,7 @@
 package com.vmartis.matchgateway.matcher.metrics
 
 import com.vmartis.matchgateway.matcher.TestcontainersConfiguration
-import com.vmartis.matchgateway.matcher.decision.infra.MatcherWorker
+import com.vmartis.matchgateway.matcher.decision.infra.DecisionProcessor
 import com.vmartis.matchgateway.matcher.decision.infra.QueueDepthGauge
 import org.assertj.core.api.Assertions.assertThat
 import org.flywaydb.core.Flyway
@@ -27,10 +27,13 @@ import java.util.concurrent.TimeUnit
 import javax.sql.DataSource
 import kotlin.math.sqrt
 
-/** AC-51 (ADR-006, D-27): the matcher exposes decided counter, processing timer, latency histogram and queue gauge. */
+/**
+ * AC-51 (ADR-006, D-27, D-28): the matcher exposes decided counter, processing timer, latency histogram and queue gauge.
+ * The listeners are not started: the tests call DecisionProcessor directly, so the deltas are exact.
+ */
 @SpringBootTest(
     webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
-    properties = ["matcher.scheduling.enabled=false"],
+    properties = ["spring.rabbitmq.listener.simple.auto-startup=false"],
 )
 // Boot disables metrics export in tests by default; the scrape needs the real Prometheus registry.
 @AutoConfigureMetrics
@@ -42,7 +45,7 @@ class MetricsIT {
 
     @Autowired lateinit var dataSource: DataSource
 
-    @Autowired lateinit var worker: MatcherWorker
+    @Autowired lateinit var processor: DecisionProcessor
 
     @Autowired lateinit var gauge: QueueDepthGauge
 
@@ -153,11 +156,14 @@ class MetricsIT {
         enrol("subjzz-b", bytes(unit(2)))
         val before = scrape()
 
-        pending("subjzz-a", bytes(unit(1))) // MATCH
-        pending("subjzz-a", bytes(unit(1))) // MATCH
-        pending("subjzz-b", bytes(unit(777))) // NO_MATCH
-        pending("subjzz-ghost", bytes(unit(3))) // FAILED
-        assertThat(worker.drain()).isEqualTo(4)
+        val ids =
+            listOf(
+                pending("subjzz-a", bytes(unit(1))), // MATCH
+                pending("subjzz-a", bytes(unit(1))), // MATCH
+                pending("subjzz-b", bytes(unit(777))), // NO_MATCH
+                pending("subjzz-ghost", bytes(unit(3))), // FAILED
+            )
+        assertThat(ids.map(processor::process)).containsOnly(true)
         gauge.refresh()
         val after = scrape()
 
@@ -186,16 +192,16 @@ class MetricsIT {
     @Test
     fun `AC-51 queue depth gauge equals the number of PENDING rows after refresh`() {
         enrol("subjzz-a", bytes(unit(1)))
-        repeat(3) { pending("subjzz-a", bytes(unit(1))) }
+        val first = (1..3).map { pending("subjzz-a", bytes(unit(1))) }
         gauge.refresh()
         assertThat(scrape().value("matchgw_queue_depth")).isEqualTo(3.0)
 
-        assertThat(worker.drain()).isEqualTo(3)
-        repeat(5) { pending("subjzz-a", bytes(unit(1))) }
+        assertThat(first.map(processor::process)).containsOnly(true)
+        val second = (1..5).map { pending("subjzz-a", bytes(unit(1))) }
         gauge.refresh()
         assertThat(scrape().value("matchgw_queue_depth")).isEqualTo(5.0)
 
-        assertThat(worker.drain()).isEqualTo(5)
+        assertThat(second.map(processor::process)).containsOnly(true)
         gauge.refresh()
         val drained = scrape()
         assertThat(drained.has("matchgw_queue_depth")).isTrue()
@@ -215,9 +221,9 @@ class MetricsIT {
     @Tag("security")
     fun `API3 no tenant or subject label on any matchgw series and no tenant or subject value in the scrape`() {
         enrol("subjzz-a", bytes(unit(1)))
-        pending("subjzz-a", bytes(unit(1)))
-        pending("subjzz-ghost", bytes(unit(3)))
-        worker.drain()
+        val ok = pending("subjzz-a", bytes(unit(1)))
+        val ghost = pending("subjzz-ghost", bytes(unit(3)))
+        assertThat(listOf(ok, ghost).map(processor::process)).containsOnly(true)
         gauge.refresh()
         val s = scrape()
 
@@ -241,17 +247,16 @@ class MetricsIT {
         try {
             dataSource.connection.use { lock ->
                 lock.autoCommit = false
-                // Holds worker A after it claimed the job, before its guarded write.
+                // Holds consumer A after it loaded the job and read the template, before its guarded write.
                 lock.createStatement().use { it.execute("lock table tenant_settings in access exclusive mode") }
-                val a = pool.submit<Int> { worker.drain() }
+                val a = pool.submit<Boolean> { processor.process(id) }
                 awaitBlockedOnTenantSettings()
 
-                jdbc.sql("update verification set lease_until = now() - interval '1 second' where id = :id").param("id", id).update()
                 jdbc.sql("delete from template_version where tenant_id = :t and subject_id = 'subjzz-a'").param("t", tenant).update()
-                assertThat(worker.drain()).isEqualTo(1) // B decides FAILED / SUBJECT_NOT_ENROLLED
+                assertThat(processor.process(id)).isTrue() // B decides FAILED / SUBJECT_NOT_ENROLLED
 
                 lock.rollback()
-                assertThat(a.get(30, TimeUnit.SECONDS)).isEqualTo(1) // A's guarded write changes 0 rows
+                assertThat(a.get(30, TimeUnit.SECONDS)).isFalse() // A's guarded write changes 0 rows
             }
         } finally {
             pool.shutdownNow()
