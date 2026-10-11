@@ -313,6 +313,29 @@ class LeakageIT : GatewayIntegrationTest() {
         assertNoLeak(output, listOf(verifyOnly, enrollOnly, none).flatMap { tokenSecrets(it) } + fragments(t))
     }
 
+    @Test
+    fun `A09 AC-41 erasure of a subject never leaks templates or tokens into logs or bodies`(output: CapturedOutput) {
+        val admin = JwtTestTokens.valid(scope = "enroll verify admin")
+        val t = valid(10).base64
+        val other = JwtTestTokens.valid(tenant = "tenant-b", scope = "enroll verify admin")
+        val enrolled = call(HttpMethod.POST, "/v1/subjects/s1/enrollment", admin, body = """{"template":"$t"}""")
+        val accepted =
+            call(HttpMethod.POST, "/v1/verifications", admin, body = """{"subjectId":"s1","probeTemplate":"$t"}""", idempotencyKey = "k1")
+        val statuses =
+            listOf(
+                call(HttpMethod.DELETE, "/v1/subjects/s1", JwtTestTokens.valid(scope = "verify")).status,
+                call(HttpMethod.DELETE, "/v1/subjects/s1", other).status,
+                call(HttpMethod.DELETE, "/v1/subjects/s1", admin).status,
+                call(HttpMethod.DELETE, "/v1/subjects/s1", admin).status,
+                call(HttpMethod.DELETE, "/v1/subjects/bad%20id", admin).status,
+            )
+
+        assertThat(enrolled.status).isEqualTo(201)
+        assertThat(accepted.status).isEqualTo(202)
+        assertThat(statuses).containsExactly(403, 404, 204, 404, 400) // malformed id → 400 (D-26)
+        assertNoLeak(output, tokenSecrets(admin) + tokenSecrets(other) + fragments(t))
+    }
+
     // ---------------------------------------------------------------- AC-44
 
     @Test
@@ -339,6 +362,9 @@ class LeakageIT : GatewayIntegrationTest() {
         responses["406 accept"] = call(HttpMethod.GET, "/v1/verifications/$id", admin, accept = "text/html")
         responses["413 body"] = call(HttpMethod.POST, "/v1/subjects/s1/enrollment", admin, body = """{"template":"${"A".repeat(9000)}"}""")
         responses["415 type"] = call(HttpMethod.PUT, "/v1/tenant/threshold", admin, body = "0.7", contentType = "text/plain")
+        responses["403 delete scope"] = call(HttpMethod.DELETE, "/v1/subjects/s1", JwtTestTokens.valid(scope = "verify"))
+        responses["404 delete unknown"] = call(HttpMethod.DELETE, "/v1/subjects/unknown-subject", admin)
+        responses["204 delete"] = call(HttpMethod.DELETE, "/v1/subjects/s1", admin)
 
         val expected =
             mapOf(
@@ -358,6 +384,9 @@ class LeakageIT : GatewayIntegrationTest() {
                 "406 accept" to 406,
                 "413 body" to 413,
                 "415 type" to 415,
+                "403 delete scope" to 403,
+                "404 delete unknown" to 404,
+                "204 delete" to 204,
             )
         expected.forEach { (name, status) ->
             val r = responses.getValue(name)

@@ -49,4 +49,46 @@ class SubjectStore(
             .update()
         return version
     }
+
+    /**
+     * Erases the subject in one transaction (ADR-007): its template versions (cascade), the probes of its pending
+     * verifications, which end FAILED/SUBJECT_ERASED (D-8), and its idempotency fingerprints (A-S3). Decided
+     * verifications stay, without template data. Returns false if the caller's tenant has no such subject.
+     */
+    @Transactional
+    fun erase(
+        tenantId: String,
+        subjectId: String,
+    ): Boolean {
+        val deleted =
+            jdbc
+                .sql("DELETE FROM subject WHERE tenant_id = :tenant AND subject_id = :subject")
+                .param("tenant", tenantId)
+                .param("subject", subjectId)
+                .update()
+        if (deleted == 0) return false
+        // status <> PENDING makes a late matcher write a guarded no-op (ADR-003, INV-5); the lease is cleared for the schema CHECK.
+        jdbc
+            .sql(
+                """
+                UPDATE verification
+                   SET status = 'FAILED', reason = 'SUBJECT_ERASED', probe = NULL, lease_token = NULL, lease_until = NULL,
+                       decided_at = now()
+                 WHERE tenant_id = :tenant AND subject_id = :subject AND status = 'PENDING'
+                """.trimIndent(),
+            ).param("tenant", tenantId)
+            .param("subject", subjectId)
+            .update()
+        jdbc
+            .sql(
+                """
+                DELETE FROM idempotency_key
+                 WHERE tenant_id = :tenant
+                   AND verification_id IN (SELECT id FROM verification WHERE tenant_id = :tenant AND subject_id = :subject)
+                """.trimIndent(),
+            ).param("tenant", tenantId)
+            .param("subject", subjectId)
+            .update()
+        return true
+    }
 }
