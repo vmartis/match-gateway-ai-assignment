@@ -1,25 +1,19 @@
 package com.vmartis.matchgateway.gateway
 
+import com.vmartis.matchgateway.gateway.security.GatewayIntegrationTest
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.Test
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.boot.health.contributor.Health
 import org.springframework.boot.health.contributor.HealthIndicator
-import org.springframework.boot.resttestclient.autoconfigure.AutoConfigureRestTestClient
-import org.springframework.boot.test.context.SpringBootTest
 import org.springframework.boot.test.context.TestConfiguration
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Import
 import org.springframework.http.HttpStatus
 import org.springframework.test.web.servlet.client.RestTestClient
 
-@SpringBootTest(
-    webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
-    properties = ["management.server.port=0"],
-)
-@AutoConfigureRestTestClient
-@Import(TestcontainersConfiguration::class, PublicHealthDownIT.ForcedDown::class)
-class PublicHealthDownIT {
+@Import(PublicHealthDownIT.ForcedDown::class)
+class PublicHealthDownIT : GatewayIntegrationTest() {
     @Autowired
     lateinit var client: RestTestClient
 

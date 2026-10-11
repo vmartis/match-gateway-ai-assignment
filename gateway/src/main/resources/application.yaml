@@ -34,3 +34,10 @@ management:
     health:
       show-details: never
       show-components: never
+
+# Resource server (ADR-004): public key only, mounted from the keygen volume in compose.
+app:
+  jwt:
+    public-key-location: ${JWT_PUBLIC_KEY_LOCATION:file:/run/keys/jwt-public.pem}
+    issuer: ${JWT_ISSUER:https://match-gateway.invalid/dev-issuer}
+    audience: ${JWT_AUDIENCE:match-gateway}

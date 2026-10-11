@@ -8,6 +8,11 @@ x-app-db: &app-db
   DB_USER: matchgw
   SPRING_CONFIG_IMPORT: optional:configtree:/run/dbcreds/
 
+# Token settings shared by the gateway (validation) and the devtoken tool (minting) – ADR-004.
+x-jwt: &jwt
+  JWT_ISSUER: https://match-gateway.invalid/dev-issuer
+  JWT_AUDIENCE: match-gateway
+
 # Container hardening for the JVM services (security review 1b). The read-only root FS needs a writable /tmp.
 x-hardening: &hardening
   read_only: true
@@ -42,6 +47,32 @@ services:
       - dbcreds:/out
     restart: "no"
 
+  # Generates the RS256 key pair + idempotency HMAC key on first start (ADR-004). The private key goes only to the
+  # issuer-keys volume, which the gateway never mounts.
+  keygen:
+    <<: *hardening
+    build:
+      context: .
+      target: devtoken
+    image: match-gateway-devtoken:local
+    command: ["keygen", "/keys/issuer", "/keys/gateway"]
+    network_mode: none
+    volumes:
+      - issuer-keys:/keys/issuer
+      - gateway-keys:/keys/gateway
+    restart: "no"
+
+  # Dev token tool, used via scripts/token.sh (`docker compose run --rm devtoken mint ...`).
+  devtoken:
+    <<: *hardening
+    image: match-gateway-devtoken:local
+    pull_policy: never
+    profiles: ["tools"]
+    network_mode: none
+    environment: *jwt
+    volumes:
+      - issuer-keys:/keys/issuer:ro
+
   postgres:
     image: postgres:17@sha256:2d2b8998d31037bf721cfdf764d76ba74171b4fab3431b7f72c27c56ddbdf9e3
     command: ["postgres", "-c", "log_error_verbosity=terse"]
@@ -69,14 +100,19 @@ services:
       context: .
       target: gateway
     mem_limit: 768m
-    environment: *app-db
+    environment:
+      <<: [*app-db, *jwt]
+      JWT_PUBLIC_KEY_LOCATION: file:/run/keys/jwt-public.pem
     volumes:
       - dbcreds:/run/dbcreds:ro
+      - gateway-keys:/run/keys:ro
     ports:
       - "127.0.0.1:8080:8080" # API on localhost only (plain HTTP); management port 8081 stays internal (D-6)
     depends_on:
       postgres:
         condition: service_healthy
+      keygen:
+        condition: service_completed_successfully
     healthcheck: *health
 
   matcher:
@@ -98,3 +134,5 @@ services:
 volumes:
   dbcreds:
   pgdata:
+  issuer-keys:
+  gateway-keys:

@@ -1,3 +1,3 @@
 rootProject.name = "match-gateway"
 
-include("common", "gateway", "matcher")
+include("common", "gateway", "matcher", "devtoken")

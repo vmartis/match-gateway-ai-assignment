@@ -1,28 +1,20 @@
 package com.vmartis.matchgateway.gateway
 
+import com.vmartis.matchgateway.gateway.security.GatewayIntegrationTest
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.boot.micrometer.metrics.test.autoconfigure.AutoConfigureMetrics
-import org.springframework.boot.resttestclient.autoconfigure.AutoConfigureRestTestClient
-import org.springframework.boot.test.context.SpringBootTest
 import org.springframework.boot.test.web.server.LocalManagementPort
-import org.springframework.context.annotation.Import
 import org.springframework.http.HttpHeaders
 import org.springframework.http.MediaType
 import org.springframework.jdbc.core.simple.JdbcClient
 import org.springframework.test.web.servlet.client.RestTestClient
 
-@SpringBootTest(
-    webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
-    properties = ["management.server.port=0"],
-)
-@AutoConfigureRestTestClient
 // Metrics export is off in tests by default; without it /actuator/prometheus would 401 merely for being unknown.
 @AutoConfigureMetrics
-@Import(TestcontainersConfiguration::class)
-class GatewaySkeletonIT {
+class GatewaySkeletonIT : GatewayIntegrationTest() {
     @Autowired
     lateinit var client: RestTestClient
 

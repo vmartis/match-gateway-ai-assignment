@@ -11,6 +11,7 @@ workers over PostgreSQL. Specification: [docs/SPEC.md](docs/SPEC.md); design: [d
 ```
 docker compose up --build        # postgres, gateway (http://127.0.0.1:8080) and 3 matcher replicas
 curl http://127.0.0.1:8080/actuator/health
+TOKEN=$(./scripts/token.sh bank-alpha client-1 "enroll verify admin")   # dev RS256 token, 15 min
 docker compose down -v           # also deletes the generated DB password and all data
 ```
 

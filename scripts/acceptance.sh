@@ -36,6 +36,23 @@ assert_body HEALTH '"status":"UP"'
 check ACTUATOR 401 "$BASE_URL/actuator/env"   # only health is exposed; everything else denied
 
 # --- acceptance criteria (one block per AC from docs/SPEC.md) ----------------
+# Tokens come from the dev tool (AC-5); never printed.
+TOKEN_ALL=$(./scripts/token.sh bank-alpha acceptance "enroll verify admin" 2>/dev/null)
+TOKEN_VERIFY=$(./scripts/token.sh bank-alpha acceptance "verify" 2>/dev/null)
+TOKEN_ENROLL=$(./scripts/token.sh bank-alpha acceptance "enroll" 2>/dev/null)
+
+# AC-6: invalid tokens are rejected; a valid token passes authentication (unknown path -> 404)
+check AC-6-none 401 "$BASE_URL/v1/anything"
+# Tamper: replace the last signature character with a different one (never a no-op).
+last=${TOKEN_ALL: -1}; [[ $last == x ]] && swap=y || swap=x
+UNKNOWN_ID=00000000-0000-4000-8000-000000000000
+check AC-6-tampered 401 -H "Authorization: Bearer ${TOKEN_ALL%?}$swap" "$BASE_URL/v1/verifications/$UNKNOWN_ID"
+check AC-6-valid 404 -H "Authorization: Bearer $TOKEN_ALL" "$BASE_URL/v1/verifications/$UNKNOWN_ID"
+check DENY-DEFAULT 403 -H "Authorization: Bearer $TOKEN_ALL" "$BASE_URL/v1/anything"
+check API5-HEAD 403 -I -H "Authorization: Bearer $TOKEN_ENROLL" "$BASE_URL/v1/verifications/$UNKNOWN_ID"
+# AC-7 / AC-8: scope rules in the filter chain
+check AC-7 403 -X PUT -H "Authorization: Bearer $TOKEN_VERIFY" -H 'Content-Type: application/json' -d '{"threshold":0.7}' "$BASE_URL/v1/tenant/threshold"
+
 # AC-1: <Given/When/Then from SPEC>
 # check AC-1 200 -X POST "$BASE_URL/api/..." -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{...}'
 # assert_body AC-1 '"id":'
