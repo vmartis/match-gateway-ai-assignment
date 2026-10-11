@@ -27,13 +27,13 @@ or tokens. Everything starts with `docker compose up --build`; accuracy (FMR/FNM
 
 ## Deployables and API summary
 
-- `gateway` (public REST API), `matcher` (worker, 3 replicas), PostgreSQL; transport = PostgreSQL `SKIP LOCKED` queue [D-3]; Gradle modules
+- `gateway` (public REST API), `matcher` (worker, 3 replicas), PostgreSQL, RabbitMQ; transport = RabbitMQ quorum queue fed by a transactional outbox, outcome guarded in PostgreSQL [D-28, ADR-009; supersedes D-3]; Gradle modules
   `gateway`, `matcher`, `common` [D-7]; tokens minted by a dev script [D-4].
 
 | Method & path | Scope | Success | Errors |
 |---|---|---|---|
 | `POST /v1/subjects/{subjectId}/enrollment` | `enroll` | `201` `{"subjectId","version"}` | 400, 401, 403, 413, 415 |
-| `DELETE /v1/subjects/{subjectId}` | `admin` | `204` | 401, 403, 404 |
+| `DELETE /v1/subjects/{subjectId}` | `admin` | `204` | 400 (malformed id, D-26), 401, 403, 404 |
 | `POST /v1/verifications` (header `Idempotency-Key`) | `verify` | `202` `{"verificationId","status":"PENDING"}` + `Location`; replay `202`/`200` | 400, 401, 403, 413, 415, 422 |
 | `GET /v1/verifications/{verificationId}` | `verify` | `200` `{"verificationId","subjectId","status","score","threshold","decidedAt"}` (+ `reason` when FAILED) | 401, 403, 404 |
 | `PUT /v1/tenant/threshold` | `admin` | `200` `{"threshold"}` (ASSUMPTION A-S1) | 400, 401, 403 |
@@ -99,8 +99,8 @@ All errors are RFC 9457 problem details (`application/problem+json`) with no sta
 | AC-24 | A PENDING verification for an enrolled subject, tenant threshold t | A matcher replica processes it | `score` = float64 reference cosine of probe vs active template within 1e-5; `MATCH` if `score >= t`, else `NO_MATCH`; `threshold` = t; `decidedAt` set. Boundary: score == t → `MATCH` | [A: "computes **cosine similarity** (`score`) and decides `MATCH` if `score >= threshold` of the tenant at decision time."] NFR-8 |
 | AC-25 | A verification posted while threshold = 0.5 | Admin sets 0.9 before it is decided | Decision uses and records 0.9 | INV-3 (INFERRED from "at decision time") |
 | AC-26 | Any verification | It reaches a terminal status | Its probe template is no longer stored | [D-11] |
-| AC-27 | Processing fails on every attempt (injected fault) | 3 attempts have been made (lease expiry counts as an attempt) | `"status":"FAILED","reason":"MAX_ATTEMPTS"`; never claimed again | [A: "A job that fails 3 times ends as `FAILED` with a reason."] A-2 |
-| AC-28 | A worker claimed a job and stalls | Its lease expires | Another worker reclaims and decides it; default lease + poll interval ≤ 30 s (asserted on config; test uses a shortened lease) | [A: "If a replica dies while holding a job, the job must be retried and decided within 30 s."] |
+| AC-27 | Processing fails on every attempt (injected fault) | 3 deliveries have been made (a redelivery after a crash counts as an attempt) | `"status":"FAILED","reason":"MAX_ATTEMPTS"` via the dead-letter queue; never processed again | [A: "A job that fails 3 times ends as `FAILED` with a reason."] A-2 |
+| AC-28 | A worker holding a job crashes (connection closed) or stalls past its processing deadline | RabbitMQ redelivers the job | Another worker decides it within 30 s; the processing deadline is ≤ 30 s (asserted on config; test uses a shortened deadline) | [A: "If a replica dies while holding a job, the job must be retried and decided within 30 s."] |
 | AC-29 | The subject has no active template | The job is processed | `FAILED` / `SUBJECT_NOT_ENROLLED` on the first attempt, no retry | BR-6 |
 
 ### US-7 Read a result (Must)
@@ -116,9 +116,9 @@ All errors are RFC 9457 problem details (`application/problem+json`) with no sta
 
 | AC | Given | When | Then | Source |
 |---|---|---|---|---|
-| AC-34 | 500 PENDING verifications in PostgreSQL (integration test), 3 concurrent workers | All are processed | Each has exactly one terminal status; applied terminal transitions = 500; result counts sum to 500 | [A: "Correctness under concurrency, and how you **proved** it (tests, not claims)."] INV-1 |
-| AC-35 | Worker A claimed J, A's lease expired, B reclaimed and decided J | A attempts its terminal write with a different status/score | 0 rows change; J keeps B's `status`, `score`, `threshold`, `decidedAt`; the result metric is not incremented for A | [A: "no duplicate or conflicting results even if a replica crashes mid-processing."] |
-| AC-36 | J is terminal | Any worker polls | J is never claimed again | INV-1 |
+| AC-34 | 500 PENDING verifications in PostgreSQL with their messages in RabbitMQ (integration test), 3 concurrent consumers | All are processed | Each has exactly one terminal status; applied terminal transitions = 500; result counts sum to 500 | [A: "Correctness under concurrency, and how you **proved** it (tests, not claims)."] INV-1 |
+| AC-35 | Worker B decided J; J's message is delivered again (duplicate publish or redelivery) and worker A processes it | A attempts its terminal write with a different status/score | 0 rows change; J keeps B's `status`, `score`, `threshold`, `decidedAt`; the result metric is not incremented for A | [A: "no duplicate or conflicting results even if a replica crashes mid-processing."] |
+| AC-36 | J is terminal | J's message is delivered again | It is acknowledged without any change or metric; J is never decided again | INV-1 |
 
 ### US-9 Tenant isolation (Must)
 
@@ -150,7 +150,7 @@ All errors are RFC 9457 problem details (`application/problem+json`) with no sta
 | AC | Given | When | Then | Source |
 |---|---|---|---|---|
 | AC-47 | T's `s1` has 2 versions, a PENDING verification with a stored probe, and decided verifications | `DELETE /v1/subjects/s1` with scope `admin` | `204`; no template version and no probe of `s1` remain; decided verifications stay readable with `status`, `score`, `threshold`, `decidedAt`; idempotency fingerprints for `s1` are deleted | [A: "Right to erasure: removes all template versions of the subject and its verification probes."] [A: "Verification results stay, without template data. Returns `204`, or `404` if unknown."] A-S3 |
-| AC-48 | `s1` unknown or already erased | Deleted | `404` problem detail | [A: "Returns `204`, or `404` if unknown."] |
+| AC-48 | `s1` unknown or already erased; or the id is malformed | Deleted | `404` problem detail; a malformed id gets `400` (D-26) | [A: "Returns `204`, or `404` if unknown."] |
 | AC-49 | A verification of `s1` is PENDING or claimed when the `204` commits | The worker writes its result / the job is next claimed | It ends `FAILED`/`SUBJECT_ERASED`, never `MATCH`/`NO_MATCH` (deterministic ordering test) | [D-8] INV-5 |
 | AC-50 | `s1` was erased | It is enrolled again | `201` with `"version":1` | A-3 (ASSUMPTION) |
 
@@ -187,7 +187,7 @@ All errors are RFC 9457 problem details (`application/problem+json`) with no sta
 | NFR-4 | Health on both apps; metrics for results, queue depth, processing duration | AC-2, AC-51 | [A: "`/actuator/health` on both apps, plus metrics: verifications by result, queue depth or lag, processing duration."] |
 | NFR-5 | Store only needed biometric data: probe deleted once decided; erasure removes all templates and probes; fingerprints keyed-hashed. Encryption at rest = Won't now | AC-23, AC-26, AC-47 | [A: "Store only what is needed; templates at rest should be encrypted (Should)."] [D-2] [D-11] |
 | NFR-6 | A job held by a stalled/crashed worker is decided ≤ 30 s later | AC-28 | [A: "If a replica dies while holding a job, the job must be retried and decided within 30 s."] |
-| NFR-7 | 0 duplicate or conflicting outcomes (500-job, 3-worker test + stale-lease writer) | AC-34..AC-36 | ASSUMPTION (scaled-down test target for L45) |
+| NFR-7 | 0 duplicate or conflicting outcomes (500-job, 3-consumer test + duplicate/redelivered message) | AC-34..AC-36 | ASSUMPTION (scaled-down test target for L45) |
 | NFR-8 | `score` within 1e-5 of the float64 reference cosine | AC-24 | ASSUMPTION |
 | NFR-9 | Request body ≤ 8 KB, else `413` | AC-42 | ASSUMPTION |
 | NFR-10 | Token TTL ≤ 15 min; clock skew ≤ 60 s | AC-5, AC-6 | ASSUMPTION (CLAUDE.md §4) |
@@ -195,7 +195,7 @@ All errors are RFC 9457 problem details (`application/problem+json`) with no sta
 
 ## Non-goals (Won't have now)
 
-- Container-kill crash-recovery test – exactly-once and reclaim are proven by integration tests AC-28, AC-34..AC-36 [D-2].
+- Container-kill crash-recovery test – exactly-once and redelivery are proven by integration tests AC-28, AC-34..AC-36 [D-2].
 - Per-tenant rate limiting (`429` + `Retry-After`) [D-2].
 - Encryption of templates at rest [D-2].
 - Long-poll / webhook notification, Grafana dashboard, per-tenant metrics (Could).
@@ -211,7 +211,7 @@ All of these go to README "Known limitations" with the production next step (BAC
 | A-S1 | `PUT /v1/tenant/threshold` returns `200` with `{"threshold":x}` | Brief gives no status; echoing the stored value is testable | Graders expect `204`; trivial change |
 | A-S2 | A non-UUID verification id returns `404`, same body as an unknown id | No difference between "malformed" and "unknown" leaks to callers (MC-1) | Graders expect `400`; trivial change |
 | A-S3 | Erasure also deletes the subject's idempotency fingerprints | Fingerprints derive from biometric data (ANALYSIS data inventory) | A replay after erasure creates a new verification instead of returning the old id – acceptable |
-| A-2 | A lease expiry counts as one of the 3 attempts | Prevents poison jobs looping forever | Healthy jobs could fail early under repeated crashes |
+| A-2 | A redelivery after a crash, a stall past the deadline or a processing error counts as one of the 3 attempts (quorum-queue delivery count, D-28) | Prevents poison jobs looping forever | Healthy jobs could fail early under repeated crashes |
 | A-3 | Version numbering restarts at 1 after erasure | Erased subject has no history to continue | Clients caching versions may be confused |
 | A-4 | Claimed jobs are reported as `PENDING` | Brief lists only 4 statuses | None |
 | A-5 | Single gateway instance in compose | Rate limiting is out of scope; nothing else is instance-local | Horizontal gateway scaling needs no change except a future shared limiter |
