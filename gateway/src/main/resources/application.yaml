@@ -13,12 +13,28 @@ spring:
   threads:
     virtual:
       enabled: true
+  # Virtual threads make applicationTaskExecutor unbounded; eager outbox publishes must not pile up during a broker outage.
+  # Saturation rejects the task and the outbox relay takes over (reviews step 12).
+  # The limit applies to the whole shared applicationTaskExecutor (today only the outbox uses it).
+  task:
+    execution:
+      simple:
+        concurrency-limit: 64
+        reject-tasks-when-limit-reached: true
   # Broker (ADR-009): password from the generated mqcreds configtree (compose), never in the repo.
   rabbitmq:
     host: ${RABBITMQ_HOST:localhost}
     port: 5672
     username: ${RABBITMQ_USER:matchgw}
     password: ${RABBITMQ_PASSWORD:}
+    # Publisher confirms + returns: the outbox row is deleted only for a confirmed, routed message (ADR-009).
+    publisher-confirm-type: correlated
+    # Bounded waits: a refused, blackholed or frozen broker never parks a publish for long (reviews step 12).
+    connection-timeout: 2s
+    channel-rpc-timeout: 5s
+    publisher-returns: true
+    template:
+      mandatory: true
   datasource:
     url: ${DB_URL:jdbc:postgresql://localhost:5432/matchgw}
     username: ${DB_USER:matchgw}
@@ -43,6 +59,8 @@ server:
 logging:
   level:
     org.apache.coyote.http11.Http11Processor: WARN
+    # A failing broker health check is visible in readiness; its WARN + stack trace per probe would flood the logs.
+    org.springframework.boot.amqp.health.RabbitHealthIndicator: ERROR
 
 # Standard actuator on the API port (D-23): only health is exposed; status only; liveness/readiness probes.
 management:

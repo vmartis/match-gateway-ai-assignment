@@ -6,6 +6,7 @@ import com.vmartis.matchgateway.gateway.auth.api.tenantId
 import com.vmartis.matchgateway.gateway.subject.api.SUBJECT_ID_PATTERN
 import com.vmartis.matchgateway.gateway.verification.domain.IdempotencyOutcome
 import com.vmartis.matchgateway.gateway.verification.infra.Fingerprinter
+import com.vmartis.matchgateway.gateway.verification.infra.OutboxPublisher
 import com.vmartis.matchgateway.gateway.verification.infra.VerificationStore
 import com.vmartis.matchgateway.gateway.verification.infra.VerificationView
 import jakarta.servlet.http.HttpServletRequest
@@ -62,6 +63,7 @@ data class VerificationResult(
 class VerificationController(
     private val verifications: VerificationStore,
     private val fingerprinter: Fingerprinter,
+    private val publisher: OutboxPublisher,
 ) {
     @PostMapping(
         "/v1/verifications",
@@ -81,7 +83,11 @@ class VerificationController(
         val subjectId = checkNotNull(request.subjectId)
         val fingerprint = fingerprinter.fingerprint(tenantId, subjectId, probe)
         return when (val outcome = verifications.submit(tenantId, idempotencyKey, subjectId, probe, fingerprint)) {
-            is IdempotencyOutcome.Created -> verificationResponse(HttpStatus.ACCEPTED, outcome.id, "PENDING")
+            is IdempotencyOutcome.Created -> {
+                // Committed at this point; the job message follows asynchronously (outbox, ADR-009).
+                publisher.publishAsync(outcome.id)
+                verificationResponse(HttpStatus.ACCEPTED, outcome.id, "PENDING")
+            }
             // Replay (AM-12): 202 while PENDING, 200 once decided, always the original id (D-10).
             is IdempotencyOutcome.Replayed ->
                 verificationResponse(if (outcome.status == "PENDING") HttpStatus.ACCEPTED else HttpStatus.OK, outcome.id, outcome.status)

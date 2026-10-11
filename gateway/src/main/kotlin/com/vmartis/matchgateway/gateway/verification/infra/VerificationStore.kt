@@ -83,7 +83,12 @@ class VerificationStore(
                         .param("id", id)
                         .query(UUID::class.java)
                         .optional()
-                if (bound.isEmpty) tx.setRollbackOnly()
+                if (bound.isEmpty) {
+                    tx.setRollbackOnly()
+                } else {
+                    // Same transaction as the verification: no job without a message, no message without a job (ADR-009).
+                    jdbc.sql("INSERT INTO outbox (verification_id) VALUES (:id)").param("id", id).update()
+                }
                 bound.orElse(null)
             }
         if (created != null) return IdempotencyOutcome.Created(created)

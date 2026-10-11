@@ -5,12 +5,20 @@ import org.springframework.amqp.core.BindingBuilder
 import org.springframework.amqp.core.Declarables
 import org.springframework.amqp.core.DirectExchange
 import org.springframework.amqp.core.Queue
+import org.springframework.boot.amqp.autoconfigure.RabbitTemplateCustomizer
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
 
 /** Declares the shared topology (ADR-009); Spring AMQP's RabbitAdmin applies it idempotently on every new connection. */
 @Configuration
 class MessagingConfig {
+    /** Returns are handled through CorrelationData by the outbox publisher; this only replaces Spring's per-return WARN. */
+    @Bean
+    fun returnsAreHandledByTheOutbox() =
+        RabbitTemplateCustomizer { template ->
+            template.setReturnsCallback { returned -> log.debug("Unroutable job message returned: {}", returned.replyText) }
+        }
+
     @Bean
     fun verificationTopology(): Declarables {
         val exchange = DirectExchange(Topology.EXCHANGE, true, false)
@@ -25,5 +33,9 @@ class MessagingConfig {
             deadLetterQueue,
             BindingBuilder.bind(deadLetterQueue).to(deadLetterExchange).with(Topology.ROUTING_KEY),
         )
+    }
+
+    private companion object {
+        val log = org.slf4j.LoggerFactory.getLogger(MessagingConfig::class.java)
     }
 }

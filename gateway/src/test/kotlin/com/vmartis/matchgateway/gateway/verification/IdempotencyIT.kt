@@ -49,6 +49,7 @@ class IdempotencyIT : GatewayIntegrationTest() {
 
     @BeforeEach
     fun cleanDatabase() {
+        jdbc.sql("delete from outbox").update()
         jdbc.sql("delete from idempotency_key").update()
         jdbc.sql("delete from verification").update()
         jdbc.sql("delete from subject").update()
@@ -182,6 +183,16 @@ class IdempotencyIT : GatewayIntegrationTest() {
         assertThat(rows[0]["tenant_id"]).isEqualTo("tenant-a")
         assertThat(rows[0]["idem_key"]).isEqualTo("k-1")
         assertThat(rows[0]["verification_id"]).isEqualTo(UUID.fromString(r.id))
+    }
+
+    @Test
+    fun `AC-18 a first use leaves at most one outbox row for the new verification and a replay adds none`() {
+        val first = submit()
+        val replay = submit()
+
+        assertThat(replay.id).isEqualTo(first.id)
+        val outbox = jdbc.sql("select verification_id::text from outbox").query(String::class.java).list()
+        assertThat(outbox).isSubsetOf(first.id) // the async publisher may already have removed it
     }
 
     @Test
