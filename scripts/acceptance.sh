@@ -83,6 +83,22 @@ check AC-33-not-uuid 404 -H "Authorization: Bearer $TOKEN_VERIFY" "$BASE_URL/v1/
 check AC-15-key 400 -X POST -H "Authorization: Bearer $TOKEN_VERIFY" -H 'Content-Type: application/json' -d "{\"subjectId\":\"$SUBJ\",\"probeTemplate\":\"$TEMPLATE\"}" "$BASE_URL/v1/verifications"
 check AC-17-unknown 202 -X POST -H "Authorization: Bearer $TOKEN_VERIFY" -H 'Content-Type: application/json' -H "Idempotency-Key: acc-ghost-$SUBJ" -d "{\"subjectId\":\"ghost-$SUBJ\",\"probeTemplate\":\"$TEMPLATE\"}" "$BASE_URL/v1/verifications"
 
+# AC-24 / AC-17 / AC-26 end to end (checkpoint 1): the 3 matcher replicas decide what the gateway accepted
+poll_final() { # id token -> echoes the final status (or TIMEOUT)
+  for _ in $(seq 1 50); do
+    st=$(curl -sS -H "Authorization: Bearer $2" "$BASE_URL/v1/verifications/$1" | sed -n 's/.*"status":"\([A-Z_]*\)".*/\1/p')
+    [[ -n $st && $st != PENDING ]] && { echo "$st"; return; }
+    sleep 0.2
+  done
+  echo TIMEOUT
+}
+FINAL=$(poll_final "$VID" "$TOKEN_VERIFY")
+[[ $FINAL == MATCH ]] && { pass=$((pass + 1)); echo "PASS  AC-24      enrolled subject, same template -> $FINAL"; } || { fail=$((fail + 1)); echo "FAIL  AC-24      expected MATCH got $FINAL"; }
+GHOST=$(curl -sS -X POST -H "Authorization: Bearer $TOKEN_VERIFY" -H 'Content-Type: application/json' -H "Idempotency-Key: acc-ghost2-$SUBJ" -d "{\"subjectId\":\"ghost2-$SUBJ\",\"probeTemplate\":\"$TEMPLATE\"}" "$BASE_URL/v1/verifications" | sed -n 's/.*"verificationId":"\([0-9a-f-]*\)".*/\1/p')
+FINAL=$(poll_final "$GHOST" "$TOKEN_VERIFY")
+check AC-17-final 200 -H "Authorization: Bearer $TOKEN_VERIFY" "$BASE_URL/v1/verifications/$GHOST"
+assert_body AC-17-final '"status":"FAILED".*"reason":"SUBJECT_NOT_ENROLLED"|"reason":"SUBJECT_NOT_ENROLLED".*"status":"FAILED"'
+
 # --- hostile inputs (>= 3 per endpoint) ----------------------------------------
 # check HOSTILE-1 400 -X POST "$BASE_URL/api/..." -H 'Content-Type: application/json' -d '{"name":"'"$(printf 'a%.0s' {1..10000})"'"}'
 
