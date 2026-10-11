@@ -226,15 +226,15 @@ class ExactlyOnceIT {
         assertThat(b.id).isEqualTo(id)
         assertThat(b.leaseToken).isNotEqualTo(a.leaseToken)
 
-        assertThat(queue.complete(b, Outcome.Decided("MATCH", 0.9, 0.5))).isTrue()
+        assertThat(queue.complete(b, Outcome.Decided("MATCH", 0.9, 0.5))).isNotNull().isGreaterThanOrEqualTo(java.time.Duration.ZERO)
         val decided = row(id)
         assertThat(decided.status).isEqualTo("MATCH")
         assertThat(decided.decidedAt).isNotNull()
         val before = decidedTotal()
 
-        assertThat(queue.complete(a, Outcome.Decided("NO_MATCH", 0.1, 0.5))).isFalse()
-        assertThat(queue.complete(a, Outcome.Failed("MAX_ATTEMPTS"))).isFalse()
-        assertThat(queue.complete(b, Outcome.Decided("NO_MATCH", 0.1, 0.5))).isFalse()
+        assertThat(queue.complete(a, Outcome.Decided("NO_MATCH", 0.1, 0.5))).isNull()
+        assertThat(queue.complete(a, Outcome.Failed("MAX_ATTEMPTS"))).isNull()
+        assertThat(queue.complete(b, Outcome.Decided("NO_MATCH", 0.1, 0.5))).isNull()
 
         val after = row(id)
         assertThat(after).isEqualTo(decided)

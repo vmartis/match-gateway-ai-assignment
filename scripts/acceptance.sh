@@ -68,10 +68,6 @@ check AC-42-size 413 -X POST -H "Authorization: Bearer $TOKEN_ALL" -H 'Content-T
 check AC-43-type 415 -X POST -H "Authorization: Bearer $TOKEN_ALL" -H 'Content-Type: text/plain' -d 'x' "$BASE_URL/v1/subjects/$SUBJ/enrollment"
 check AC-7-enrol 403 -X POST -H "Authorization: Bearer $TOKEN_VERIFY" -H 'Content-Type: application/json' -d "{\"template\":\"$TEMPLATE\"}" "$BASE_URL/v1/subjects/$SUBJ/enrollment"
 
-# AC-1: <Given/When/Then from SPEC>
-# check AC-1 200 -X POST "$BASE_URL/api/..." -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{...}'
-# assert_body AC-1 '"id":'
-
 # AC-14 / AC-17 / AC-30..33: submit and read verifications (decisions come from the matcher in step 5)
 TOKEN_B=$(./scripts/token.sh bank-beta acceptance "verify" 2>/dev/null)
 check AC-14 202 -X POST -H "Authorization: Bearer $TOKEN_VERIFY" -H 'Content-Type: application/json' -H "Idempotency-Key: acc-$SUBJ" -d "{\"subjectId\":\"$SUBJ\",\"probeTemplate\":\"$TEMPLATE\"}" "$BASE_URL/v1/verifications"
@@ -99,8 +95,87 @@ FINAL=$(poll_final "$GHOST" "$TOKEN_VERIFY")
 check AC-17-final 200 -H "Authorization: Bearer $TOKEN_VERIFY" "$BASE_URL/v1/verifications/$GHOST"
 assert_body AC-17-final '"status":"FAILED".*"reason":"SUBJECT_NOT_ENROLLED"|"reason":"SUBJECT_NOT_ENROLLED".*"status":"FAILED"'
 
-# --- hostile inputs (>= 3 per endpoint) ----------------------------------------
-# check HOSTILE-1 400 -X POST "$BASE_URL/api/..." -H 'Content-Type: application/json' -d '{"name":"'"$(printf 'a%.0s' {1..10000})"'"}'
+# --- steps 7-9: threshold, erasure, idempotency, metrics -----------------------
+RUN="$(date +%s)$RANDOM"
+JSON='Content-Type: application/json'
+
+# AC-45 / AC-46 / AC-7: tenant threshold. Restored to the default 0.5 on any exit, so an aborted run cannot leave
+# bank-alpha at 0.7 (which would skew eval/eval.py).
+trap 'curl -sS -o /dev/null --max-time 10 -X PUT -H "Authorization: Bearer $TOKEN_ALL" -H "$JSON" -d "{\"threshold\":0.5}" "$BASE_URL/v1/tenant/threshold" || true' EXIT
+check AC-45 200 -X PUT -H "Authorization: Bearer $TOKEN_ALL" -H "$JSON" -d '{"threshold":0.7}' "$BASE_URL/v1/tenant/threshold"
+assert_body AC-45 '"threshold":0\.7'
+check AC-46-low 400 -X PUT -H "Authorization: Bearer $TOKEN_ALL" -H "$JSON" -d '{"threshold":-0.01}' "$BASE_URL/v1/tenant/threshold"
+check AC-46-high 400 -X PUT -H "Authorization: Bearer $TOKEN_ALL" -H "$JSON" -d '{"threshold":1.01}' "$BASE_URL/v1/tenant/threshold"
+check AC-46-string 400 -X PUT -H "Authorization: Bearer $TOKEN_ALL" -H "$JSON" -d '{"threshold":"abc"}' "$BASE_URL/v1/tenant/threshold"
+check AC-46-missing 400 -X PUT -H "Authorization: Bearer $TOKEN_ALL" -H "$JSON" -d '{}' "$BASE_URL/v1/tenant/threshold"
+check AC-7-threshold 403 -X PUT -H "Authorization: Bearer $TOKEN_ENROLL" -H "$JSON" -d '{"threshold":0.7}' "$BASE_URL/v1/tenant/threshold"
+check AC-45-restore 200 -X PUT -H "Authorization: Bearer $TOKEN_ALL" -H "$JSON" -d '{"threshold":0.5}' "$BASE_URL/v1/tenant/threshold"
+assert_body AC-45-restore '"threshold":0\.5'
+
+# AC-47 / AC-48: erase a throwaway enrolled subject (D-26: malformed id -> 400)
+ERASE="acc-erase-$RUN"
+check AC-47-enrol 201 -X POST -H "Authorization: Bearer $TOKEN_ALL" -H "$JSON" -d "{\"template\":\"$TEMPLATE\"}" "$BASE_URL/v1/subjects/$ERASE/enrollment"
+check AC-47 204 -X DELETE -H "Authorization: Bearer $TOKEN_ALL" "$BASE_URL/v1/subjects/$ERASE"
+check AC-48 404 -X DELETE -H "Authorization: Bearer $TOKEN_ALL" "$BASE_URL/v1/subjects/$ERASE"
+check AC-48-malformed 400 -X DELETE -H "Authorization: Bearer $TOKEN_ALL" "$BASE_URL/v1/subjects/a%20b"
+check AC-47-scope 403 -X DELETE -H "Authorization: Bearer $TOKEN_VERIFY" "$BASE_URL/v1/subjects/$SUBJ"
+
+# AC-18 / AC-19 / AC-20: idempotent submit
+IDEM_KEY="acc-idem-$RUN"
+IDEM_BODY="{\"subjectId\":\"$SUBJ\",\"probeTemplate\":\"$TEMPLATE\"}"
+check AC-18-first 202 -X POST -H "Authorization: Bearer $TOKEN_VERIFY" -H "$JSON" -H "Idempotency-Key: $IDEM_KEY" -d "$IDEM_BODY" "$BASE_URL/v1/verifications"
+IDEM_ID=$(sed -n 's/.*"verificationId":"\([0-9a-f-]*\)".*/\1/p' <<<"$BODY")
+out=$(curl -sS --max-time 10 -w $'\n%{http_code}' -X POST -H "Authorization: Bearer $TOKEN_VERIFY" -H "$JSON" -H "Idempotency-Key: $IDEM_KEY" -d "$IDEM_BODY" "$BASE_URL/v1/verifications")
+BODY=${out%$'\n'*}; replay_status=${out##*$'\n'}
+replay_id=$(sed -n 's/.*"verificationId":"\([0-9a-f-]*\)".*/\1/p' <<<"$BODY")
+if [[ -n $IDEM_ID && $replay_id == "$IDEM_ID" && ( $replay_status == 200 || $replay_status == 202 ) ]]; then
+  pass=$((pass + 1)); echo "PASS  AC-18      replay returned the same verificationId ($replay_status)"
+else
+  fail=$((fail + 1)); echo "FAIL  AC-18      replay status $replay_status, id '$replay_id' vs '$IDEM_ID'"
+fi
+check AC-19 422 -X POST -H "Authorization: Bearer $TOKEN_VERIFY" -H "$JSON" -H "Idempotency-Key: $IDEM_KEY" -d "{\"subjectId\":\"other-$SUBJ\",\"probeTemplate\":\"$TEMPLATE\"}" "$BASE_URL/v1/verifications"
+check AC-20 202 -X POST -H "Authorization: Bearer $TOKEN_B" -H "$JSON" -H "Idempotency-Key: $IDEM_KEY" -d "$IDEM_BODY" "$BASE_URL/v1/verifications"
+other_id=$(sed -n 's/.*"verificationId":"\([0-9a-f-]*\)".*/\1/p' <<<"$BODY")
+if [[ -n $other_id && $other_id != "$IDEM_ID" ]]; then
+  pass=$((pass + 1)); echo "PASS  AC-20      tenant B got its own verificationId"
+else
+  fail=$((fail + 1)); echo "FAIL  AC-20      tenant B id '$other_id' vs tenant A '$IDEM_ID'"
+fi
+
+# AC-51: metrics live in the matcher on 8081 (unpublished). The image is a bare JRE (no curl/wget), so use bash /dev/tcp.
+# Each replica has its own registry, so scrape all of them and look at the union.
+scrape_matcher() { # container-id -> HTTP response text
+  docker exec -i "$1" bash -c 'exec 3<>/dev/tcp/127.0.0.1/8081; printf "GET /actuator/prometheus HTTP/1.0\r\nHost: localhost\r\n\r\n" >&3; cat <&3'
+}
+sleep 6   # let the 5 s gauge refresh and the replicas decide the verifications above
+METRICS=""
+for cid in $(docker compose ps -q matcher); do METRICS+="$(scrape_matcher "$cid" 2>/dev/null)"$'\n'; done
+BODY=$METRICS
+assert_body AC-51-counter '^matchgw_verifications_decided_total\{result="(MATCH|NO_MATCH|FAILED)"\}'
+assert_body AC-51-gauge '^matchgw_queue_depth '
+assert_body AC-51-timer '^matchgw_matcher_processing_seconds_count'
+assert_body AC-51-histogram '^matchgw_verification_latency_seconds_bucket'
+if grep -Eq '^matchgw_[^ ]*[{,](tenant|tenant_id|subject|subject_id)=' <<<"$METRICS"; then
+  fail=$((fail + 1)); echo "FAIL  AC-51-labels no tenant/subject label allowed on matchgw_ series"
+else
+  pass=$((pass + 1)); echo "PASS  AC-51-labels no tenant/subject label on matchgw_ series"
+fi
+# AC-52: nothing but health on the public port
+check AC-52 401 "$BASE_URL/actuator/prometheus"
+
+# --- hostile inputs (>= 3 per endpoint; the full sets are in the ITs) -----------
+HKEY="Idempotency-Key: acc-hostile-$RUN"
+check HOSTILE-verify-short 400 -X POST -H "Authorization: Bearer $TOKEN_VERIFY" -H "$JSON" -H "$HKEY-1" -d "{\"subjectId\":\"$SUBJ\",\"probeTemplate\":\"AAAA\"}" "$BASE_URL/v1/verifications"
+check HOSTILE-verify-id 400 -X POST -H "Authorization: Bearer $TOKEN_VERIFY" -H "$JSON" -H "$HKEY-2" -d "{\"subjectId\":\"a b\",\"probeTemplate\":\"$TEMPLATE\"}" "$BASE_URL/v1/verifications"
+check HOSTILE-verify-type 400 -X POST -H "Authorization: Bearer $TOKEN_VERIFY" -H "$JSON" -H "$HKEY-3" -d "{\"subjectId\":123,\"probeTemplate\":\"$TEMPLATE\"}" "$BASE_URL/v1/verifications"
+check HOSTILE-verify-size 413 -X POST -H "Authorization: Bearer $TOKEN_VERIFY" -H "$JSON" -H "$HKEY-4" -d "{\"subjectId\":\"$SUBJ\",\"probeTemplate\":\"$(printf 'A%.0s' $(seq 1 9000))\"}" "$BASE_URL/v1/verifications"
+check HOSTILE-verify-dupkey 400 -X POST -H "Authorization: Bearer $TOKEN_VERIFY" -H "$JSON" -H "$HKEY-5" -d "{\"subjectId\":\"$SUBJ\",\"subjectId\":\"x\",\"probeTemplate\":\"$TEMPLATE\"}" "$BASE_URL/v1/verifications"
+check HOSTILE-enrol-json 400 -X POST -H "Authorization: Bearer $TOKEN_ALL" -H "$JSON" -d '{"template":' "$BASE_URL/v1/subjects/$SUBJ/enrollment"
+check HOSTILE-enrol-null 400 -X POST -H "Authorization: Bearer $TOKEN_ALL" -H "$JSON" -d '{"template":null}' "$BASE_URL/v1/subjects/$SUBJ/enrollment"
+check HOSTILE-threshold-nan 400 -X PUT -H "Authorization: Bearer $TOKEN_ALL" -H "$JSON" -d '{"threshold":NaN}' "$BASE_URL/v1/tenant/threshold"
+check HOSTILE-threshold-null 400 -X PUT -H "Authorization: Bearer $TOKEN_ALL" -H "$JSON" -d '{"threshold":null}' "$BASE_URL/v1/tenant/threshold"
+check HOSTILE-get-traversal 400 -H "Authorization: Bearer $TOKEN_VERIFY" "$BASE_URL/v1/verifications/..%2F..%2Fetc"
+check HOSTILE-delete-id 400 -X DELETE -H "Authorization: Bearer $TOKEN_ALL" "$BASE_URL/v1/subjects/$(printf 'a%.0s' $(seq 1 65))"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 ((fail == 0))

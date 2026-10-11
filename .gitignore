@@ -29,3 +29,9 @@ secrets/
 
 ### Generated evaluation data (dataset/gen_dataset.py) ###
 dataset/*.jsonl
+
+### Load-test output (loadtest/run.sh) ###
+loadtest/results/
+
+### Python bytecode ###
+__pycache__/

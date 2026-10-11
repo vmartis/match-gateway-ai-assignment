@@ -61,11 +61,14 @@ class JobQueue(
             ).param("maxAttempts", properties.maxAttempts)
             .update()
 
-    /** True iff this claimant wrote the one and only outcome; the probe is dropped in the same statement (D-11). */
+    /**
+     * Writes the outcome iff this claimant still holds the lease (INV-1); the probe is dropped in the same statement (D-11).
+     * Returns decidedAt − createdAt when this claimant wrote the one and only outcome, null when the write changed 0 rows.
+     */
     fun complete(
         job: Job,
         outcome: Outcome,
-    ): Boolean {
+    ): Duration? {
         val (status, score, threshold, reason) =
             when (outcome) {
                 is Outcome.Decided -> listOf(outcome.status, outcome.score, outcome.threshold, null)
@@ -78,6 +81,7 @@ class JobQueue(
                    SET status = :status, score = :score, threshold = :threshold, reason = :reason,
                        probe = NULL, lease_token = NULL, lease_until = NULL, decided_at = now()
                  WHERE id = :id AND status = 'PENDING' AND lease_token = :token
+                RETURNING EXTRACT(EPOCH FROM decided_at - created_at)
                 """.trimIndent(),
             ).param("status", status)
             .param("score", score)
@@ -85,7 +89,11 @@ class JobQueue(
             .param("reason", reason)
             .param("id", job.id)
             .param("token", job.leaseToken)
-            .update() == 1
+            .query(Double::class.java)
+            .optional()
+            // decidedAt − createdAt from the one DB clock (AM-11), for the latency histogram (AC-51).
+            .map { Duration.ofNanos((it * NANOS_PER_SECOND).toLong()) }
+            .orElse(null)
     }
 
     /** Gives a failed attempt back after the retry delay (still guarded by the token). */
@@ -103,4 +111,8 @@ class JobQueue(
     }
 
     private fun Duration.seconds(): Double = toMillis() / 1000.0
+
+    private companion object {
+        const val NANOS_PER_SECOND = 1_000_000_000.0
+    }
 }

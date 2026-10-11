@@ -321,7 +321,7 @@ class MatcherIT {
                 com.vmartis.matchgateway.matcher.decision.domain.Outcome
                     .Failed("MAX_ATTEMPTS"),
             ),
-        ).isFalse()
+        ).isNull()
         assertThat(row(id).status).isEqualTo("MATCH")
     }
 
@@ -334,10 +334,10 @@ class MatcherIT {
         expireLease(id)
         val b = queue.claim(10).single()
 
-        assertThat(queue.complete(a, Outcome.Failed("MAX_ATTEMPTS"))).isFalse()
+        assertThat(queue.complete(a, Outcome.Failed("MAX_ATTEMPTS"))).isNull()
         assertThat(row(id).status).isEqualTo("PENDING")
 
-        assertThat(queue.complete(b, Decision.decide(0.9, 0.5))).isTrue()
+        assertThat(queue.complete(b, Decision.decide(0.9, 0.5))).isNotNull().isGreaterThanOrEqualTo(java.time.Duration.ZERO)
         assertThat(row(id).status).isEqualTo("MATCH")
     }
 

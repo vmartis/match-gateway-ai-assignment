@@ -6,6 +6,7 @@ import com.vmartis.matchgateway.matcher.decision.domain.Decision
 import com.vmartis.matchgateway.matcher.decision.domain.Job
 import com.vmartis.matchgateway.matcher.decision.domain.Outcome
 import io.micrometer.core.instrument.MeterRegistry
+import io.micrometer.core.instrument.Timer
 import org.slf4j.LoggerFactory
 import org.springframework.jdbc.core.simple.JdbcClient
 import org.springframework.stereotype.Component
@@ -20,6 +21,11 @@ class MatcherWorker(
     private val transactions: TransactionTemplate,
     private val meters: MeterRegistry,
 ) {
+    private val processing = Timer.builder("matchgw.matcher.processing").register(meters)
+
+    // decidedAt − createdAt of each written outcome, as a histogram for server-side percentiles (AC-51, D-13).
+    private val latency = Timer.builder("matchgw.verification.latency").publishPercentileHistogram().register(meters)
+
     /** Reaps exhausted jobs, then claims and processes batches until a batch comes back short. Returns jobs processed. */
     fun drain(): Int {
         var processed = 0
@@ -27,7 +33,7 @@ class MatcherWorker(
             // Reap on every batch, not only at the start: under sustained load drain() may never return (reviews step 5).
             decided("FAILED", queue.reap())
             val batch = queue.claim(properties.batchSize)
-            batch.forEach(::process)
+            batch.forEach { job -> processing.record(Runnable { process(job) }) }
             processed += batch.size
         } while (batch.size == properties.batchSize)
         return processed
@@ -36,8 +42,11 @@ class MatcherWorker(
     private fun process(job: Job) {
         try {
             // Counted only after the commit, and only if this claimant wrote the one outcome (INV-1).
-            val written = transactions.execute { decide(job).takeIf { queue.complete(job, it) } }
-            written?.let { decided(if (it is Outcome.Decided) it.status else "FAILED") }
+            val written = transactions.execute { decide(job).let { outcome -> queue.complete(job, outcome)?.let { outcome to it } } }
+            written?.let { (outcome, decidedAfter) ->
+                decided(if (outcome is Outcome.Decided) outcome.status else "FAILED")
+                latency.record(decidedAfter)
+            }
         } catch (e: RuntimeException) {
             // Only the job id and the exception class: messages may carry data (CLAUDE.md §4).
             log.warn("Verification {} attempt {} failed: {}", job.id, job.attempts, e.javaClass.simpleName)

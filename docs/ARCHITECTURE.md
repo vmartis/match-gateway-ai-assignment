@@ -25,7 +25,7 @@
 | AM-16 | springdoc-openapi is listed in the stack, but no Boot-4-verified version is known. It is not in the scope budget. | API docs, ZAP API scan | Won't now (README limitation). | no |
 | AM-17 | ZAP: `scripts/owasp-scan.sh` (referenced in SECURITY.md) does not exist. | Evals | Ship-check decides. It is of low value without an OpenAPI doc. | no |
 | AM-18 | D-16: JDK 25 has no built-in UUIDv7 as far as I know (verify). | Ids | `UUID.randomUUID()` (v4, SecureRandom). | no |
-| AM-19 | FAILED/SUBJECT_ERASED transitions happen in the gateway. The gateway therefore also increments `matchgw_verifications_decided_total{result="FAILED"}`, and Prometheus sums across apps. | AC-51 | As stated. | no |
+| AM-19 | **Superseded by D-27 (gateway exposes no metrics; erasure transitions are not counted).** FAILED/SUBJECT_ERASED transitions happen in the gateway. The gateway therefore also increments `matchgw_verifications_decided_total{result="FAILED"}`, and Prometheus sums across apps. | AC-51 | As stated. | no |
 | AM-20 | AC-34 runs "3 workers" as 3 concurrent claimer threads against one Postgres in one JVM. Postgres is the only coordination point. Real 3-JVM competition happens in compose (eval run, acceptance). | AC-34 evidence strength | As stated; README says so. | no |
 | AM-21 | Matcher defaults: lease 10 s, idle poll 200 ms, batch 20, retry backoff after an exception 1 s. Lease + poll = 10.2 s, which is ≤ 30 s. NFR-2 risk: on average +100 ms of poll wait. | AC-28, NFR-2 | As stated. LISTEN/NOTIFY wake-up is a tuning lever, Won't now. | no |
 | AM-22 | Matchers depend on postgres only, not on the gateway. They tolerate missing tables: a poll error is logged with SQLState only and retried. This satisfies "start concurrently" in AC-3. | AC-3 | As stated. | no |
@@ -294,7 +294,7 @@ Also covered: MC-4a idempotency across tenants (AC-20); the private key never in
 | AC-24..29, 34..36 | `MatcherIT`, `ExactlyOnceIT` (500 jobs × 3 claimers, stale writer, trigger) | 3 real replicas decide the eval run: every one of 5000 pairs ends terminal exactly once (eval asserts no FAILED or timeout) | README limitation: no container-kill test (D-2) |
 | AC-37..41 | `TenantIsolationIT` (both modules), `LeakageIT` (OutputCaptureExtension) | Cross-tenant GET/DELETE → 404 bodies byte-compared with an unknown id; then `docker compose logs gateway matcher \| grep -F` for every submitted base64, token and `Bearer ` → 0 hits | – |
 | AC-45..50 | `ThresholdIT`, `ErasureIT` | threshold "abc", 1.01 → 400; DELETE → 204, second → 404 | – |
-| AC-51..52 | `MetricsIT` | public `/actuator/prometheus` → 401; `docker compose exec gateway curl -s localhost:8081/actuator/prometheus` → names present | – |
+| AC-51..52 | `MetricsIT`, `QueueDepthSchedulingIT` (matcher, D-27), `HealthEndpointIT` | public `/actuator/prometheus` → 401; `scripts/acceptance.sh` scrapes all matcher replicas on 8081 → names present, no tenant/subject labels | – |
 | AC-53..56 | `eval/test_eval.py` | `python3 eval/eval.py`, run twice, outputs diffed | Ship-check if not run in step 10 |
 | AC-57..58 | – | `loadtest/run.sh` 60 s in Ship-check; README records machine, numbers, met / not met; server p95 from `matchgw_verification_latency` buckets | – |
 | ZAP | – | Ship-check only, if `scripts/owasp-scan.sh` is added. Of limited value without an OpenAPI doc (AM-16/17). Report honestly in SECURITY.md, or "not run". | – |

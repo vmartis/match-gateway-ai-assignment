@@ -46,3 +46,16 @@ the API port: exposure `health` only, `show-details`/`show-components: never`, l
 `EndpointRequest.to(HealthEndpoint)`; every other `/actuator/**` path falls into the `denyAll` fallback. `PublicHealthController`
 and `ManagementPortGuard` are removed. Consequence: port isolation for Prometheus no longer exists on the gateway – step 10 decides
 how gateway metrics are exposed (the matcher's metrics stay on its unpublished port 8081).
+
+## Amendment 3 (D-27, step 10)
+
+All metrics are served by the matcher only, on its unpublished server port 8081 (actuator exposure `health,prometheus`); the
+gateway exposes health only (Amendment 2 unchanged, AC-52). Placement of the metrics listed under "Decision":
+- `matchgw.verifications.decided{result}` – matcher only, incremented after commit for outcomes it wrote (MATCH, NO_MATCH,
+  FAILED incl. reaped MAX_ATTEMPTS). The gateway's FAILED/SUBJECT_ERASED transitions are **not** counted (AM-19 superseded).
+- `matchgw.matcher.processing` – one sample per processed claimed job (decided, stale write or released after an error).
+- `matchgw.verification.latency` – percentile histogram, one sample per written outcome: `decided_at − created_at` returned
+  by the guarded write (DB clock; `decided_at` is the matcher transaction start, so a lower bound of time-to-visible).
+- `matchgw.queue.depth` – in the matcher, `count(*)` of PENDING rows refreshed at a fixed rate of 5 s (fixed rate, not fixed
+  delay: fixed-delay tasks share the poll thread and would freeze during a long drain). Every replica reports the same global
+  value – aggregate with `max`, not `sum`.
