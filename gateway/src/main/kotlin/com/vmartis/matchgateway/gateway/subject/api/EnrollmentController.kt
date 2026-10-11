@@ -20,7 +20,10 @@ const val SUBJECT_ID_PATTERN = "^[A-Za-z0-9._-]{1,64}$"
 
 data class EnrollmentRequest(
     @field:NotNull val template: String?,
-)
+) {
+    // Spring logs the bound request at DEBUG via toString(): template data must never reach logs (AC-41).
+    override fun toString() = "EnrollmentRequest(template=<redacted>)"
+}
 
 data class EnrollmentResponse(
     val subjectId: String,

@@ -34,7 +34,10 @@ const val IDEMPOTENCY_KEY_PATTERN = "^[\\x21-\\x7E]{1,64}$"
 data class VerificationRequest(
     @field:NotNull @field:Pattern(regexp = SUBJECT_ID_PATTERN) val subjectId: String?,
     @field:NotNull val probeTemplate: String?,
-)
+) {
+    // Spring logs the bound request at DEBUG via toString(): template data must never reach logs (AC-41).
+    override fun toString() = "VerificationRequest(subjectId=$subjectId, probeTemplate=<redacted>)"
+}
 
 data class VerificationAccepted(
     val verificationId: UUID,
