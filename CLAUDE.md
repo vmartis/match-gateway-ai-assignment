@@ -29,6 +29,8 @@
 - Exactly one @RestControllerAdvice mapping errors to ProblemDetail. No stack traces or internal ids in responses.
 - Config via env vars. Immutability by default (val, data classes, read-only collections).
 - No `!!`. No speculative abstractions (no interface with one impl "for later", no unused extension points).
+- Prefer framework built-ins (actuator, Spring Security, validation, ProblemDetail) over custom re-implementations.
+  If a built-in doesn't work, find and fix the root cause or ask; never work around it with custom code.
 
 ## 4. Security rules (non-negotiable)
 - Treat all input as hostile: check type, length, range. Parameterized SQL only. Never hand-roll crypto or auth.
