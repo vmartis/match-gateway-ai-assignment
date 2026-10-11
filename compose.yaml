@@ -17,7 +17,7 @@ x-jwt: &jwt
 x-hardening: &hardening
   read_only: true
   tmpfs:
-    - /tmp
+    - /tmp:size=64m # capped: tmpfs counts against container memory
   cap_drop:
     - ALL
   security_opt:

@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.ValueSource
 import org.springframework.beans.factory.annotation.Autowired
+import org.springframework.boot.health.actuate.endpoint.HealthEndpointGroups
 import org.springframework.test.web.servlet.client.RestTestClient
 import tools.jackson.databind.json.JsonMapper
 
@@ -15,6 +16,9 @@ import tools.jackson.databind.json.JsonMapper
 class HealthEndpointIT : GatewayIntegrationTest() {
     @Autowired
     lateinit var client: RestTestClient
+
+    @Autowired
+    lateinit var groups: HealthEndpointGroups
 
     private fun get(
         path: String,
@@ -38,6 +42,22 @@ class HealthEndpointIT : GatewayIntegrationTest() {
         val groups = body["groups"]
         assertThat((0 until groups.size()).map { groups[it].asString() }).containsExactlyInAnyOrder("liveness", "readiness")
         assertThat(result.responseBody).doesNotContain("components").doesNotContain("details")
+    }
+
+    @Test
+    fun `D-24 readiness group includes the database contributor and the readiness state`() {
+        val readiness = checkNotNull(groups.get("readiness"))
+
+        assertThat(readiness.isMember("db")).isTrue()
+        assertThat(readiness.isMember("readinessState")).isTrue()
+    }
+
+    @Test
+    fun `D-24 liveness group does not include the database contributor`() {
+        val liveness = checkNotNull(groups.get("liveness"))
+
+        assertThat(liveness.isMember("db")).isFalse()
+        assertThat(liveness.isMember("livenessState")).isTrue()
     }
 
     @ParameterizedTest

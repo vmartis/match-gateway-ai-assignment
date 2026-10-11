@@ -80,7 +80,7 @@ class ScopeAuthorizationIT : GatewayIntegrationTest() {
             }
     }
 
-    @ParameterizedTest(name = "API5 {0} {1} with scope {2} reaches routing (404, no handler yet)")
+    @ParameterizedTest(name = "API5 {0} {1} with scope {2} passes authorization (handler decides, never 401/403)")
     @MethodSource("rules")
     fun `API5 token with the required scope passes authorization`(
         method: HttpMethod,
@@ -89,7 +89,7 @@ class ScopeAuthorizationIT : GatewayIntegrationTest() {
     ) {
         val r = call(method, uri, JwtTestTokens.valid(scope = scope))
 
-        assertThat(r.status).isEqualTo(404)
+        assertPassesAuthorization(r.status)
     }
 
     @ParameterizedTest(name = "API5 {0} {1} requires {2}: scope {3} only is 403")
@@ -132,7 +132,7 @@ class ScopeAuthorizationIT : GatewayIntegrationTest() {
         uri: String,
         @Suppress("UNUSED_PARAMETER") scope: String,
     ) {
-        assertThat(call(method, uri, JwtTestTokens.valid(scope = "enroll verify admin")).status).isEqualTo(404)
+        assertPassesAuthorization(call(method, uri, JwtTestTokens.valid(scope = "enroll verify admin")).status)
     }
 
     @Test
@@ -144,7 +144,7 @@ class ScopeAuthorizationIT : GatewayIntegrationTest() {
 
     @Test
     fun `API5 a scope only needs to be present among several`() {
-        assertThat(call(HttpMethod.PUT, "/v1/tenant/threshold", JwtTestTokens.valid(scope = "verify admin")).status).isEqualTo(404)
+        assertPassesAuthorization(call(HttpMethod.PUT, "/v1/tenant/threshold", JwtTestTokens.valid(scope = "verify admin")).status)
     }
 
     @ParameterizedTest(name = "API5 authenticated token on unlisted path {0} is 403 (default deny)")
@@ -217,6 +217,11 @@ class ScopeAuthorizationIT : GatewayIntegrationTest() {
                 .returnResult(String::class.java)
 
         assertThat(r.status.value()).isEqualTo(403)
+    }
+
+    /** Authorization passed and the handler answered on its own: a 2xx-4xx status, never 401/403 and never a 5xx. */
+    private fun assertPassesAuthorization(status: Int) {
+        assertThat(status).isBetween(200, 499).isNotIn(401, 403)
     }
 
     private fun assertForbidden(r: Result) {

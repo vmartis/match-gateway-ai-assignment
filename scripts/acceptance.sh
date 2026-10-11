@@ -54,6 +54,19 @@ check DENY-DEFAULT 403 -H "Authorization: Bearer $TOKEN_ALL" "$BASE_URL/v1/anyth
 check API5-HEAD 403 -I -H "Authorization: Bearer $TOKEN_ENROLL" "$BASE_URL/v1/verifications/$UNKNOWN_ID"
 # AC-7 / AC-8: scope rules in the filter chain
 check AC-7 403 -X PUT -H "Authorization: Bearer $TOKEN_VERIFY" -H 'Content-Type: application/json' -d '{"threshold":0.7}' "$BASE_URL/v1/tenant/threshold"
+# AC-9 / AC-10 / AC-11 / AC-12 / AC-42 / AC-43: enrolment (template = unit vector e0, generated with python3 stdlib)
+TEMPLATE=$(python3 -c 'import base64,struct; print(base64.b64encode(struct.pack("<128f",1.0,*([0.0]*127))).decode())')
+SUBJ="acc-$(date +%s)"
+check AC-9 201 -X POST -H "Authorization: Bearer $TOKEN_ALL" -H 'Content-Type: application/json' -d "{\"template\":\"$TEMPLATE\"}" "$BASE_URL/v1/subjects/$SUBJ/enrollment"
+assert_body AC-9 '"version":1'
+check AC-10 201 -X POST -H "Authorization: Bearer $TOKEN_ALL" -H 'Content-Type: application/json' -d "{\"template\":\"$TEMPLATE\"}" "$BASE_URL/v1/subjects/$SUBJ/enrollment"
+assert_body AC-10 '"version":2'
+# hostile inputs on enrolment
+check AC-11-short 400 -X POST -H "Authorization: Bearer $TOKEN_ALL" -H 'Content-Type: application/json' -d '{"template":"AAAA"}' "$BASE_URL/v1/subjects/$SUBJ/enrollment"
+check AC-12-id 400 -X POST -H "Authorization: Bearer $TOKEN_ALL" -H 'Content-Type: application/json' -d "{\"template\":\"$TEMPLATE\"}" "$BASE_URL/v1/subjects/a%20b/enrollment"
+check AC-42-size 413 -X POST -H "Authorization: Bearer $TOKEN_ALL" -H 'Content-Type: application/json' -d "{\"template\":\"$(printf 'A%.0s' $(seq 1 9000))\"}" "$BASE_URL/v1/subjects/$SUBJ/enrollment"
+check AC-43-type 415 -X POST -H "Authorization: Bearer $TOKEN_ALL" -H 'Content-Type: text/plain' -d 'x' "$BASE_URL/v1/subjects/$SUBJ/enrollment"
+check AC-7-enrol 403 -X POST -H "Authorization: Bearer $TOKEN_VERIFY" -H 'Content-Type: application/json' -d "{\"template\":\"$TEMPLATE\"}" "$BASE_URL/v1/subjects/$SUBJ/enrollment"
 
 # AC-1: <Given/When/Then from SPEC>
 # check AC-1 200 -X POST "$BASE_URL/api/..." -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{...}'

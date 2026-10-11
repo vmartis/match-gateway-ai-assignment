@@ -1,6 +1,15 @@
 spring:
   application:
     name: gateway
+  # JSON-only API: no form or multipart parsing, which would read bodies before authentication and the 8 KB limit
+  # (security review step 3, HIGH F-1/F-2).
+  mvc:
+    formcontent:
+      filter:
+        enabled: false
+  servlet:
+    multipart:
+      enabled: false
   threads:
     virtual:
       enabled: true
@@ -23,6 +32,12 @@ server:
     whitelabel:
       enabled: false
 
+# Tomcat logs the first malformed request of each window at INFO with the raw input and a stack trace (security
+# review step 3): attacker-controlled text must not reach the logs.
+logging:
+  level:
+    org.apache.coyote.http11.Http11Processor: WARN
+
 # Standard actuator on the API port (D-23): only health is exposed; status only; liveness/readiness probes.
 management:
   endpoints:
@@ -35,6 +50,9 @@ management:
       show-components: never
       probes:
         enabled: true
+      group:
+        readiness:
+          include: readinessState,db # D-24: not ready while the database is unreachable
   health:
     probes:
       enabled: true
