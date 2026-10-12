@@ -58,8 +58,8 @@ class VerificationStore(
                 jdbc
                     .sql(
                         """
-                        INSERT INTO verification (id, tenant_id, subject_id, status, probe, attempts)
-                        VALUES (:id, :tenant, :subject, 'PENDING', :probe, 0)
+                        INSERT INTO verification (id, tenant_id, subject_id, status, probe)
+                        VALUES (:id, :tenant, :subject, 'PENDING', :probe)
                         """.trimIndent(),
                     ).param("id", id)
                     .param("tenant", tenantId)

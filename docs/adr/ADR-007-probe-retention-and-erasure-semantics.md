@@ -13,9 +13,9 @@
 - The probe is nulled in the terminal UPDATE. The schema enforces `(status='PENDING') = (probe IS NOT NULL)`.
 - `DELETE /v1/subjects/{id}` runs one transaction:
   1. delete the `subject` row; 0 rows → 404; versions cascade;
-  2. `UPDATE verification SET status='FAILED', reason='SUBJECT_ERASED', probe=NULL, lease_token=NULL, lease_until=NULL, decided_at=now() WHERE tenant_id=? AND subject_id=? AND status='PENDING'`;
+  2. `UPDATE verification SET status='FAILED', reason='SUBJECT_ERASED', probe=NULL, decided_at=now() WHERE tenant_id=? AND subject_id=? AND status='PENDING'`;
   3. delete the idempotency rows of that subject's verifications.
-- A late worker write is a guarded no-op (ADR-003).
+- A late worker write is a guarded no-op (ADR-003, since D-28 ADR-009: `WHERE id AND status='PENDING'`).
 
 ## Alternatives considered
 

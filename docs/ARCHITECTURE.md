@@ -12,7 +12,7 @@
 | AM-3 | **Scope check order.** `@PreAuthorize` runs after `@RequestBody` binding, so a caller without the scope gets body parsing and a 400 validation oracle instead of 403. | AC-7 semantics, A01/API5 | **Critique recommends:** URL-level `authorizeHttpRequests` rules (`hasAuthority('SCOPE_x')` per method + path) in the SecurityFilterChain – reject before the body is read; tenant ownership stays in SQL. Requires changing CLAUDE.md §4 "@PreAuthorize for role checks". | **yes** |
 | AM-4 | **osv-scanner lockfile.** `verify.sh` runs `osv-scanner … --lockfile gradle.lockfile`. A multi-module build writes per-module lockfiles. | verify.sh fails wherever osv-scanner is installed | Turn on `dependencyLocking { lockAllConfigurations() }` in every module. Change the line to `osv-scanner scan source -r .`, which auto-detects lockfiles. | **yes** (human's gate script) |
 | AM-5 | **Public health path.** | AC-2 | **Resolved by D-23** (supersedes D-19): standard actuator health on the API port (no separate management port), probes enabled, `EndpointRequest.to(HealthEndpoint)` permitted; see ADR-006 amendment 2. | no (resolved) |
-| AM-6 | Persistence uses `JdbcClient` (via the data-jdbc starter) with hand-written SQL, not Spring Data JDBC repositories. Every write is a locking, conditional or upsert statement (`SKIP LOCKED`, `ON CONFLICT`, guarded `UPDATE`). | Code style | Use JdbcClient only; recorded in ADR-003. | no |
+| AM-6 | Persistence uses `JdbcClient` (via the data-jdbc starter) with hand-written SQL, not Spring Data JDBC repositories. Every write is a locking, conditional or upsert statement (`ON CONFLICT`, guarded `UPDATE`). | Code style | Use JdbcClient only; recorded in ADR-003. | no |
 | AM-7 | ASSUMPTION: a DB trigger makes terminal verification rows immutable. This is defence in depth for INV-1. | AC-34..36, AC-49 | Add it in V2 (step 6). | no |
 | AM-8 | How D-8 is implemented: erasure **terminally fails** PENDING/claimed verifications (`FAILED`/`SUBJECT_ERASED`, probe NULL) in the same transaction as the delete. A worker's later guarded write then affects 0 rows. | AC-49 | As stated. | no |
 | AM-9 | Residual race: a verification POSTed *concurrently* with erasure may commit after the erasure statement. It then ends `SUBJECT_NOT_ENROLLED`, not `SUBJECT_ERASED`. Its probe lives until that decision, which takes milliseconds. | AC-49 edge | Accept and document. | no |
@@ -26,9 +26,9 @@
 | AM-17 | ZAP: `scripts/owasp-scan.sh` (referenced in SECURITY.md) does not exist. | Evals | Ship-check decides. It is of low value without an OpenAPI doc. | no |
 | AM-18 | D-16: JDK 25 has no built-in UUIDv7 as far as I know (verify). | Ids | `UUID.randomUUID()` (v4, SecureRandom). | no |
 | AM-19 | **Superseded by D-27 (gateway exposes no metrics; erasure transitions are not counted).** FAILED/SUBJECT_ERASED transitions happen in the gateway. The gateway therefore also increments `matchgw_verifications_decided_total{result="FAILED"}`, and Prometheus sums across apps. | AC-51 | As stated. | no |
-| AM-20 | AC-34 runs "3 workers" as 3 concurrent claimer threads against one Postgres in one JVM. Postgres is the only coordination point. Real 3-JVM competition happens in compose (eval run, acceptance). | AC-34 evidence strength | As stated; README says so. | no |
-| AM-21 | Matcher defaults: lease 10 s, idle poll 200 ms, batch 20, retry backoff after an exception 1 s. Lease + poll = 10.2 s, which is ≤ 30 s. NFR-2 risk: on average +100 ms of poll wait. | AC-28, NFR-2 | As stated. LISTEN/NOTIFY wake-up is a tuning lever, Won't now. | no |
-| AM-22 | Matchers depend on postgres only, not on the gateway. They tolerate missing tables: a poll error is logged with SQLState only and retried. This satisfies "start concurrently" in AC-3. | AC-3 | As stated. | no |
+| AM-20 | AC-34 runs "3 workers" as 3 concurrent listener consumers (one JVM, real RabbitMQ and Postgres containers); since D-28 the broker distributes, Postgres guards the outcome. Real 3-replica competition happens in compose (eval run, acceptance, load test). | AC-34 evidence | As stated. | no |
+| AM-21 | **Superseded by D-28/ADR-009.** Was: lease 10 s, idle poll 200 ms, batch 20, retry backoff 1 s. Now: processing deadline 10 s (≤ 30 s), prefetch 1, immediate requeue on error, no polling. | AC-28, NFR-2 | As stated. | no |
+| AM-22 | Matchers depend on postgres and rabbitmq, not on the gateway. Since D-28 they only consume messages: a processing error before the gateway's migrations ran is rejected and retried by the broker (counts toward the 3 deliveries; in compose the gateway is up before any job exists). | AC-3 | As stated. | no |
 | AM-23 | The body limit is an app filter registered **after** bearer authentication. Unauthenticated large bodies get 401 without being read. | AC-42 | As stated. | no |
 | AM-24 | Token TTL is 15 min. The eval tool re-mints tokens per phase (enrol / submit / poll). | AC-53 | As stated. | no |
 | AM-25 | Gateway-only `securityTest` Gradle task: runs JUnit tests tagged `security`, and they still run in `build`. | Evals | As stated. | no |
@@ -58,21 +58,21 @@
 
 ## 3. Domain model (reused from ANALYSIS.md §4)
 
-- **Entities** (ANALYSIS classDiagram): Tenant (threshold, default 0.5), Subject (tenant-scoped), TemplateVersion (version, active, template – special category), Verification (status, score, thresholdUsed, reason, createdAt, decidedAt, attempts, lease), Probe (transient, stored as a column on Verification), IdempotencyRecord (key ≤ 64, HMAC fingerprint, 24 h).
-- **States** (ANALYSIS stateDiagram): `PENDING → (CLAIMED) → MATCH | NO_MATCH | FAILED`.
-  - CLAIMED is not a stored status. It is `status='PENDING' AND lease_token IS NOT NULL AND lease_until >= now()`. The API shows it as PENDING (A-4).
+- **Entities** (ANALYSIS classDiagram): Tenant (threshold, default 0.5), Subject (tenant-scoped), TemplateVersion (version, active, template – special category), Verification (status, score, thresholdUsed, reason, createdAt, decidedAt), Outbox entry (verification id until the broker confirmed the job, ADR-009), Probe (transient, stored as a column on Verification), IdempotencyRecord (key ≤ 64, HMAC fingerprint, 24 h).
+- **States** (ANALYSIS stateDiagram): `PENDING → MATCH | NO_MATCH | FAILED` (a job held by a consumer stays PENDING, A-4).
+  - A job held by a consumer is not a stored state: the row stays `PENDING` until the guarded write (A-4).
   - `PENDING → FAILED(SUBJECT_ERASED)` is done by the gateway's erasure transaction (D-8).
 - **How each invariant is enforced:**
 
 | INV | Enforcement |
 |---|---|
-| INV-1 exactly-once | Guarded terminal `UPDATE … WHERE status='PENDING' AND lease_token=:token`. The applied count must be 1 before the metric is incremented. A V2 trigger rejects any UPDATE of a terminal row. CHECK `(status='PENDING') = (decided_at IS NULL)`. |
+| INV-1 exactly-once | Guarded terminal `UPDATE … WHERE id=:id AND status='PENDING'` (ADR-009); delivery is at-least-once, so duplicates change 0 rows. Metrics only after commit and only for 1 written row. A V2 trigger rejects any UPDATE of a terminal row. CHECK `(status='PENDING') = (decided_at IS NULL)`. |
 | INV-2 one active version | `subject` row upsert serialises enrolments of one subject. Partial UNIQUE index `(tenant_id, subject_id) WHERE active`. |
 | INV-3 threshold at decision time | The matcher reads `tenant_settings` in the same transaction as the terminal write and stores it in `verification.threshold`. |
 | INV-4 tenant isolation | Every SQL statement has a `tenant_id = :t` predicate, taken from the JWT `tenant_id` claim, never from the request body or path. The matcher loads the template by `(tenant_id, subject_id)` of the job row. |
 | INV-5 erasure | One transaction: delete the `subject` row (cascades to `template_version`), terminally fail pending verifications with `probe=NULL`, delete idempotency rows. |
 | INV-6 idempotency scope | PK `(tenant_id, idem_key)`; `ON CONFLICT … DO UPDATE … WHERE created_at < now()-24h`. |
-| INV-7 attempts | Every claim does `attempts+1`; claims only take `attempts < 3`. A reaper fails rows with `attempts ≥ 3` whose lease has expired or been released, with `MAX_ATTEMPTS`. CHECK `attempts BETWEEN 0 AND 3`. |
+| INV-7 attempts | At most 3 deliveries per job: quorum queue `x-delivery-limit=2` counts rejects, crashes and consumer timeouts (never nacks); the dead-letter consumer writes `FAILED`/`MAX_ATTEMPTS` (ADR-009, D-28). |
 
 ## 4. Architecture
 
@@ -89,9 +89,9 @@ gateway/   …gateway.auth.infra        SecurityConfig, JwtConfig (decoder + val
            …gateway.verification.{api,domain,infra} VerificationController (POST/GET), DTOs; IdempotencyOutcome; VerificationStore, Fingerprinter (HMAC)
            …gateway.tenant.{api,infra}        ThresholdController; TenantSettingsStore
            …gateway.metrics.infra     QueueDepthGauge
-           resources/db/migration     V1__schema.sql, V2__terminal_immutable.sql   (Flyway owned by gateway, D-7)
+           resources/db/migration     V1__schema.sql, V2__terminal_immutable.sql, V3__outbox.sql, V4__drop_lease.sql   (Flyway owned by gateway, D-7)
 matcher/   …matcher.decision.domain   Decision (score, threshold → MATCH/NO_MATCH), Job
-           …matcher.decision.infra    JobQueue (claim, reap, complete, release), MatcherWorker (drain loop, @Scheduled), MatcherProperties
+           …matcher.decision.infra    JobQueue (load, guarded complete/failMaxAttempts), DecisionProcessor, VerificationListener, DeadLetterListener, MatcherProperties, QueueDepthGauge
 devtoken/  …devtoken                  Main: `keygen`, `mint --tenant --sub --scope [--ttl]` (AM-1)
 ```
 
@@ -116,88 +116,50 @@ Other build and runtime choices:
 - No request-body logging.
 - An empty CORS allowlist (machine callers only).
 
-### Matcher protocol (D-3, ADR-003)
+### Matcher protocol (D-28, ADR-009 – supersedes ADR-003)
 
-> **Superseded by D-28 / ADR-009 (RabbitMQ + transactional outbox).** This section describes the implemented
-> state until PLAN steps 11–14 land; step 14 rewrites it.
+**Publish (gateway, transactional outbox):** the verification row, its idempotency record and an `outbox` row are written in
+one transaction. After commit the gateway publishes the verification **id only** (persistent, mandatory, publisher confirms)
+on a bounded executor and deletes the outbox row on a routed confirm. `OutboxRelay` re-publishes rows older than 15 s (lost
+publish, broker down or hung, gateway crash) and stops at the first failure. Duplicates are possible and harmless.
 
-**Claim** (one short transaction):
+**Topology** (declared by both apps from `common`'s `Topology`): direct exchange `matchgw.verifications` → quorum queue
+`matchgw.verifications` (`x-delivery-limit=2` = at most 3 deliveries, at-least-once dead-lettering with `reject-publish`,
+explicit dead-letter routing key) → dead-letter quorum queue `matchgw.verifications.dead` (`x-delivery-limit=-1`, never drops).
 
-```sql
-WITH next AS (
-  SELECT id FROM verification
-  WHERE status = 'PENDING' AND attempts < 3
-    AND (lease_until IS NULL OR lease_until < now())
-  ORDER BY created_at
-  LIMIT :batch
-  FOR UPDATE SKIP LOCKED)
-UPDATE verification v
-   SET attempts = v.attempts + 1, lease_token = :token, lease_until = now() + :lease
-  FROM next WHERE v.id = next.id
-RETURNING v.id, v.tenant_id, v.subject_id, v.probe, v.attempts, v.created_at;
-```
-
-`:token` is a fresh random UUID per claim call.
-
-**Reaper** (start of each poll):
-
-```sql
-UPDATE verification
-   SET status='FAILED', reason='MAX_ATTEMPTS', probe=NULL, lease_token=NULL, lease_until=NULL, decided_at=now()
- WHERE status='PENDING' AND attempts >= 3 AND (lease_until IS NULL OR lease_until < now())
-RETURNING id, created_at, decided_at;
-```
-
-A lease expiry and a processing exception count the same way: every claim that does not end in a terminal write is a failed attempt (A-2).
-
-**Process** (per job, one transaction):
-1. `SELECT template FROM template_version WHERE tenant_id=:t AND subject_id=:s AND active`.
-2. `SELECT threshold FROM tenant_settings WHERE tenant_id=:t`; use 0.5 if there is no row.
-3. Decide in the domain:
-   - no template → `FAILED`/`SUBJECT_NOT_ENROLLED` (AC-29, no retry);
-   - otherwise compute the cosine in float64; `score >= t` → MATCH.
+**Consume (matcher, one message = one job):** `VerificationListener`, manual ack, 3 consumers per replica, prefetch 1.
+1. Body must be a 36-byte canonical UUID, else ack and drop (poison, never retried).
+2. `DecisionProcessor.process(id)` in one transaction with timeout = processing deadline (default 10 s, ≤ 30 s):
+   - `SELECT … FROM verification WHERE id=:id AND status='PENDING'` – unknown or terminal → no-op;
+   - active template of the row's own (tenant, subject) and the tenant threshold (0.5 if none); no template →
+     `FAILED`/`SUBJECT_NOT_ENROLLED` (AC-29, no retry); otherwise float64 cosine, `score >= t` → MATCH;
+   - guarded terminal write (below).
+3. Commit, then `basicAck`. On a processing error `basicReject(requeue=true)` – never `basicNack`, which does not count toward
+   the delivery limit. The 3rd failed delivery dead-letters the job; `DeadLetterListener` writes `FAILED`/`MAX_ATTEMPTS`
+   with the same guard (retry with a delay if the write fails).
 
 **Terminal write (the guard):**
 
 ```sql
 UPDATE verification
-   SET status=:status, score=:score, threshold=:threshold, reason=:reason,
-       probe=NULL, lease_token=NULL, lease_until=NULL, decided_at=now()
- WHERE id=:id AND status='PENDING' AND lease_token=:token
-RETURNING created_at, decided_at;
+   SET status=:status, score=:score, threshold=:threshold, reason=:reason, probe=NULL, decided_at=now()
+ WHERE id=:id AND status='PENDING'
+RETURNING EXTRACT(EPOCH FROM decided_at - created_at);
 ```
 
-A stale writer (worker A) affects 0 rows in either case:
-- worker B's reclaim replaced `lease_token`, or
-- the row is already terminal (B decided it, the reaper failed it, or erasure failed it).
+A duplicate, redelivered or late message changes 0 rows and is acked; the result counter and the latency histogram are
+recorded only after the commit and only when 1 row was written. The V2 trigger rejects any UPDATE of a decided row.
 
-The result counter and the latency histogram are recorded only when 1 row is returned.
+**Erasure race (D-8):** erasure fails pending rows to `FAILED`/`SUBJECT_ERASED` in its own transaction. A matcher that loaded
+the job before and writes after it changes 0 rows (READ COMMITTED re-checks `status='PENDING'` after the row lock), so a job is
+never MATCH/NO_MATCH after the 204; a write committed before the erasure produced a decision before the 204 (allowed).
 
-**Release on exception:**
+**30 s bound (AC-28):** a crashed replica's connection closes and the broker requeues its unacked job at once (counted as a
+delivery). A stalled-but-connected consumer ends its transaction at the processing deadline (JDBC query timeouts; Hikari
+connection timeout 5 s and pgJDBC socket timeout 35 s for the other waits), rejects, and the job is redelivered. With prefetch 1
+a stuck consumer holds no other jobs. RabbitMQ's own consumer timeout (≥ 1 min) is not relied on.
 
-```sql
-UPDATE verification SET lease_token=NULL, lease_until=now()+:retryDelay
- WHERE id=:id AND status='PENDING' AND lease_token=:token
-```
-
-Only the exception class and the job UUID are logged, never the message.
-
-**Erasure race (D-8):**
-- Erasure UPDATEs pending rows to `FAILED`/`SUBJECT_ERASED` with `probe=NULL, lease_token=NULL`.
-- A worker that loaded the template before the delete and writes after it gets 0 rows, so the job is never MATCH/NO_MATCH after the 204.
-- A worker whose write committed before the erasure produced a decision before the 204. That is allowed. Its probe is already NULL.
-- Lock order is the same everywhere: the `subject` row first (enrol and erase), then verification rows. Claim skips locked rows. The terminal write waits for erasure's row lock, then re-evaluates `status='PENDING'` and gets false.
-
-**30 s bound (AC-28):**
-- A crash at time t leaves `lease_until ≤ t+10 s`.
-- The next idle poll (≤ 200 ms later) reclaims the job and decides it in milliseconds: ≤ t+10.3 s.
-- If the crash happened on attempt 3, the reaper turns it into `FAILED`/`MAX_ATTEMPTS` in the same window, which is still "decided".
-- `MatcherProperties` checks `lease + pollInterval ≤ 30 s` at startup and fails fast otherwise.
-- All lease arithmetic uses the DB `now()`, so there is no clock skew between containers.
-
-**Loop:** `@Scheduled(fixedDelay = poll-interval)` calls `drain()`. `drain()` runs reap, then claims batches until a batch comes back short. Disabled in tests with `matcher.scheduling.enabled=false`; tests call `drain()` from N threads.
-
-### Data model (V1, plus V2 trigger)
+### Data model (V1, V2 trigger, V3 outbox, V4 drops the lease columns)
 
 | Table | Column | Type | Constraints | PII / biometric – why stored |
 |---|---|---|---|---|
@@ -217,12 +179,11 @@ Only the exception class and the job UUID are logged, never the message.
 | | probe | bytea | CHECK `(status='PENDING') = (probe IS NOT NULL)`; CHECK length 512 | **biometric** – needed only until decided (D-11); the schema enforces AC-26 |
 | | score, threshold | double precision | CHECK `status NOT IN (MATCH,NO_MATCH) OR (score, threshold NOT NULL)` | biometric-derived score; kept as the result |
 | | reason | varchar(32) | CHECK IN (SUBJECT_NOT_ENROLLED, SUBJECT_ERASED, MAX_ATTEMPTS); CHECK `(status='FAILED') = (reason IS NOT NULL)` | – |
-| | attempts | int | NOT NULL DEFAULT 0, CHECK 0..3 | – |
-| | lease_token | uuid | NULL; CHECK `status='PENDING' OR lease_token IS NULL` | – |
-| | lease_until | timestamptz | NULL | – |
 | | created_at | timestamptz | NOT NULL DEFAULT now() | – |
 | | decided_at | timestamptz | CHECK `(status='PENDING') = (decided_at IS NULL)` | – |
-| | indexes | | `(created_at) WHERE status='PENDING'` (claim and queue depth); `(tenant_id, subject_id)` (erasure) | |
+| | indexes | | `(created_at) WHERE status='PENDING'` (queue-depth gauge, outbox backfill); `(tenant_id, subject_id)` (erasure) | |
+| outbox | verification_id | uuid | PK, FK → verification ON DELETE CASCADE (V3) | – |
+| | created_at | timestamptz | NOT NULL DEFAULT now(); index for the relay | – |
 | idempotency_key | tenant_id, idem_key | varchar(64), varchar(64) | PK (tenant_id, idem_key) | – |
 | | fingerprint | bytea | NOT NULL, CHECK length 32 | HMAC-SHA256(tenant ‖ 0 ‖ subjectId ‖ 0 ‖ probe bytes) – biometric derivative, keyed so it cannot be linked (D-10); 24 h; deleted on erasure (A-S3) |
 | | verification_id | uuid | NOT NULL, FK → verification(id); INDEX | – |
@@ -267,9 +228,9 @@ All `/v1` responses carry the Spring Security default headers: `nosniff`, and `C
 **Trust boundaries:**
 
 ```
-[Tenant backend / attacker] --HTTP + Bearer--> (TB1) gateway:8080 --JDBC--> (TB2) postgres
-                                                  gateway:8081 (mgmt, compose network only)
-matcher x3 --JDBC--> postgres ; matcher:8081 (compose network only)
+[Tenant backend / attacker] --HTTP + Bearer--> (TB1) gateway:8080 (API + health only, D-23) --JDBC--> (TB2) postgres
+gateway --AMQP 5672, id only, shared broker user--> (TB5) rabbitmq <--AMQP-- matcher x3 (compose network only, no TLS)
+matcher x3 --JDBC--> postgres ; matcher:8081 actuator health + prometheus (compose network only, D-27)
 [Operator] --docker compose run devtoken--> issuer-keys volume (TB3: private key never mounted into gateway/matcher)
 logs (stdout of gateway/matcher/postgres) (TB4: leaves the trust zone to operators/log stores)
 ```
@@ -279,7 +240,8 @@ logs (stdout of gateway/matcher/postgres) (TB4: leaves the trust zone to operato
 | T1 | S | A07, API2 | Token forgery/replay (MC-2): alg=none, HS256 with the public key as secret, a foreign RSA key, wrong iss/aud, expired, missing tenant_id | `NimbusJwtDecoder.withPublicKey(..).signatureAlgorithm(RS256)`; validators: timestamp (60 s skew), issuer, `aud` claim validator, required `sub`/`tenant_id`/`exp`/`iat`, TTL ≤ 900 s; the gateway holds only the public key; constant 401 body | 2 | AC-6 (parameterised negative set), AC-5 |
 | T2 | I, E | A01, API1, API5 | Cross-tenant BOLA/enumeration (MC-1) and missing-scope calls | Tenant only from the JWT; `tenant_id` predicate in every SQL; 404 identical for foreign and unknown ids; random UUIDs; URL scope rules per path (all methods) in the filter chain, `denyAll` fallback (D-18) | 2, 4, 7, 8 | AC-7, AC-37, AC-38, AC-39, AC-40, AC-20 |
 | T3 | I | A09, A10, API3 | Template or token leakage via logs or error bodies (MC-3): Jackson messages echoing tokens, PSQLException "Failing row contains", Spring's default `error_description`, stack traces | Constant problem bodies; never log exception messages from parse or DB paths; `logServerErrorDetail=false`; postgres `log_error_verbosity=terse`; no body or header logging; `server.error.include-*=never`; response DTOs have no template fields | 3, 7 (step 8 and 9 tests extend the scan) | AC-41 (log and body scan), AC-11, AC-43, AC-30 |
-| T4 | T | A06, A08 | Conflicting or duplicate results from a zombie replica, a double claim, or an erasure race (MC: R-3, R-5) | `SKIP LOCKED` claim with lease token; guarded terminal UPDATE (token + PENDING); reaper with attempts cap; erasure terminal-fails in one transaction; immutable-terminal trigger | 5, 6, 8 | AC-34, AC-35, AC-36, AC-49, AC-27 |
+| T4 | T | A06, A08 | Conflicting or duplicate results from a zombie replica, duplicate or redelivered messages, or an erasure race (MC: R-3, R-5) | Guarded terminal UPDATE (`status='PENDING'`); manual ack after commit; delivery limit + dead-letter consumer; erasure terminal-fails in one transaction; immutable-terminal trigger | 6, 8, 13 | AC-34, AC-35, AC-36, AC-49, AC-27 |
+| T7 | S, T, D | A02, A06, API4 | Broker abuse (D-28): forged ids on the job or dead-letter exchange, oversized or poison messages, broker outage | Broker unpublished, generated credentials, no guest/admin/plugins, distribution on loopback; message = id only, tenant taken from the DB row, guarded write; 36-byte body check + `max_message_size` 4096; outbox + bounded publisher; residuals (README): the shared broker identity can forge dead letters (the DLQ consumer does not require an `x-death` reason `delivery_limit`) to force MAX_ATTEMPTS, or purge the queue – with no reconciler, a purged queue or lost broker volume leaves rows PENDING with their probe (NFR-5); bursts above the 64-task publish bound fall back to the 15 s relay; no queue max length (broker alarms are the only backpressure) | 11, 12, 13 | AC-27, AC-59 |
 | T5 | D | API4, A10 | Resource exhaustion and hostile payloads (MC-5, MC-6): huge or nested bodies, NaN/Inf, wrong length, chunked uploads, unique-key floods | 8 KB limit filter (Content-Length plus a bounded read); strict base64 length precheck; finite and norm validation; no NaN in JSON (Jackson default); 415 on non-JSON; Hikari pool caps. **Residual:** no rate limit and no idempotency TTL cleanup (Won't, D-2) – README | 3, 4 | AC-42, AC-43, AC-11, AC-16, AC-46 |
 | T6 | T, E | A03 | Supply chain (added by critique): hallucinated or typosquatted dependency coordinates, known-vulnerable transitive deps, secrets committed to git | Exact coordinates verified before adding (CLAUDE.md §4); Gradle dependency locking in every module; osv-scanner + gitleaks in `verify.sh`; keys generated at runtime, `*.pem`/`*.key` gitignored | 1a, 2 | `./scripts/verify.sh` output (osv-scanner, gitleaks); `git ls-files` key check (step 2) |
 
@@ -294,7 +256,7 @@ Also covered: MC-4a idempotency across tenants (AC-20); the private key never in
 | AC-9..13, 42..44 | `TemplateCodecTest`, `EnrollmentIT` | Hostile set via python3 one-liners: 511-byte template, NaN template, norm 1.02, 65-char id, `a%2Fb`, 9 KB body → 413, `text/plain` → 415, `{"template":123}` → 400; every error body grepped for the submitted base64 | – |
 | AC-14..17, 30..33 | `VerificationApiIT`, `MatcherIT` | POST → 202 + Location; poll GET → MATCH; `ghost` → FAILED/SUBJECT_NOT_ENROLLED; `not-a-uuid` → 404; key 65 → 400 | – |
 | AC-18..23 | `IdempotencyIT` | replay → same id, 200; different body → 422; other tenant same key → new id | – |
-| AC-24..29, 34..36 | `MatcherIT`, `ExactlyOnceIT` (500 jobs × 3 claimers, stale writer, trigger) | 3 real replicas decide the eval run: every one of 5000 pairs ends terminal exactly once (eval asserts no FAILED or timeout) | README limitation: no container-kill test (D-2) |
+| AC-24..29, 34..36 | `MatcherIT`, `ExactlyOnceIT` (500 messages × 3 consumers, stale writer, duplicates, trigger), `DecisionProcessorIT`, `JobQueueIT`, `DeadLetterListenerIT`, `MatcherStallIT`, `ErasureOrderingIT` | 3 real replicas decide the eval run: every one of 5000 pairs ends terminal exactly once (eval asserts no FAILED or timeout) | README limitation: no container-kill test (D-2) |
 | AC-37..41 | `TenantIsolationIT` (both modules), `LeakageIT` (OutputCaptureExtension) | Cross-tenant GET/DELETE → 404 bodies byte-compared with an unknown id; then `docker compose logs gateway matcher \| grep -F` for every submitted base64, token and `Bearer ` → 0 hits | – |
 | AC-45..50 | `ThresholdIT`, `ErasureIT` | threshold "abc", 1.01 → 400; DELETE → 204, second → 404 | – |
 | AC-51..52 | `MetricsIT`, `QueueDepthSchedulingIT` (matcher, D-27), `HealthEndpointIT` | public `/actuator/prometheus` → 401; `scripts/acceptance.sh` scrapes all matcher replicas on 8081 → names present, no tenant/subject labels | – |

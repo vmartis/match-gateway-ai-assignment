@@ -238,7 +238,6 @@ class VerificationIT : GatewayIntegrationTest() {
         assertThat(row["subject_id"]).isEqualTo("subj.x_1-A")
         assertThat(row["status"]).isEqualTo("PENDING")
         assertThat(row["probe"] as ByteArray).isEqualTo(probe)
-        assertThat(row["attempts"]).isEqualTo(0)
         assertThat(row["decided_at"]).isNull()
         assertThat(totalRows()).isEqualTo(1)
     }
@@ -517,14 +516,9 @@ class VerificationIT : GatewayIntegrationTest() {
     }
 
     @Test
-    fun `AC-31 a claimed verification is still reported as PENDING without decision fields`() {
+    fun `AC-31 a verification held by a consumer is simply PENDING without decision fields`() {
         val id = UUID.randomUUID()
         insertPending(id)
-        jdbc
-            .sql("update verification set attempts = 2, lease_token = :lt, lease_until = now() + interval '10 seconds' where id = :id")
-            .param("lt", UUID.randomUUID())
-            .param("id", id)
-            .update()
 
         val r = read(id.toString())
 
@@ -550,15 +544,15 @@ class VerificationIT : GatewayIntegrationTest() {
         assertThat(id).isNotEqualTo(forged.toString())
         val row =
             jdbc
-                .sql("select tenant_id, status, score, threshold, reason, attempts from verification where id = :id")
+                .sql("select tenant_id, status, score, threshold, reason from verification where id = :id")
                 .param("id", UUID.fromString(id))
                 .query {
                     rs,
                     _,
                     ->
-                    listOf(rs.getString(1), rs.getString(2), rs.getObject(3), rs.getObject(4), rs.getObject(5), rs.getInt(6))
+                    listOf(rs.getString(1), rs.getString(2), rs.getObject(3), rs.getObject(4), rs.getObject(5))
                 }.single()
-        assertThat(row).containsExactly("tenant-a", "PENDING", null, null, null, 0)
+        assertThat(row).containsExactly("tenant-a", "PENDING", null, null, null)
     }
 
     @ParameterizedTest(name = "AC-15 API4 repeated Idempotency-Key headers {0} are 400 and create no row")

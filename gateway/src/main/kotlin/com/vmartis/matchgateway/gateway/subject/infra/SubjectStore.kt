@@ -67,12 +67,12 @@ class SubjectStore(
                 .param("subject", subjectId)
                 .update()
         if (deleted == 0) return false
-        // status <> PENDING makes a late matcher write a guarded no-op (ADR-003, INV-5); the lease is cleared for the schema CHECK.
+        // status <> PENDING makes a late matcher write a guarded no-op (ADR-009, INV-5).
         jdbc
             .sql(
                 """
                 UPDATE verification
-                   SET status = 'FAILED', reason = 'SUBJECT_ERASED', probe = NULL, lease_token = NULL, lease_until = NULL,
+                   SET status = 'FAILED', reason = 'SUBJECT_ERASED', probe = NULL,
                        decided_at = now()
                  WHERE tenant_id = :tenant AND subject_id = :subject AND status = 'PENDING'
                 """.trimIndent(),

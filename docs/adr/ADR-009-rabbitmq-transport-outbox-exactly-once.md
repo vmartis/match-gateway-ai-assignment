@@ -73,3 +73,7 @@
   frozen socket (pgJDBC socketTimeout 35 s, above the 30 s maximum deadline) are bounded separately; the commit itself is not.
 - (step 13) A message lost after its publish was confirmed (queue purged, broker volume lost) leaves its verification
   PENDING with its probe: there is no reconciler re-publishing old PENDING rows (README Known limitations).
+- (step 14, upgrade) V4 backfills an outbox row for every PENDING verification, so jobs created before the outbox existed are
+  published. Their old attempt count is dropped with the column: such a job gets up to 3 broker deliveries again (at most 6 in
+  total across the switch). Stop old gateway/matcher replicas before V4 runs – an old gateway would fail on the dropped
+  `attempts` column.

@@ -144,7 +144,7 @@ class IdempotencyIT : GatewayIntegrationTest() {
         jdbc
             .sql(
                 "update verification set status = 'MATCH', score = 0.91, threshold = 0.5, decided_at = now(), " +
-                    "probe = null, lease_token = null, lease_until = null where id = :id",
+                    "probe = null where id = :id",
             ).param("id", UUID.fromString(id))
             .update()
     }

@@ -95,6 +95,31 @@ FINAL=$(poll_final "$GHOST" "$TOKEN_VERIFY")
 check AC-17-final 200 -H "Authorization: Bearer $TOKEN_VERIFY" "$BASE_URL/v1/verifications/$GHOST"
 assert_body AC-17-final '"status":"FAILED".*"reason":"SUBJECT_NOT_ENROLLED"|"reason":"SUBJECT_NOT_ENROLLED".*"status":"FAILED"'
 
+# --- AC-1 / ADR-009: RabbitMQ broker, quorum queues, 3 matcher consumers ---------
+QUEUES=$(docker compose exec -T rabbitmq rabbitmqctl -q list_queues name type 2>/dev/null)
+BODY=$QUEUES
+assert_body AC-1-queue-jobs $'^matchgw\\.verifications[[:space:]]+quorum'
+assert_body AC-1-queue-dlq '^matchgw\.verifications\.dead[[:space:]]+quorum'
+CONSUMERS=$(docker compose exec -T rabbitmq rabbitmqctl -q list_consumers queue_name 2>/dev/null | grep -c '^matchgw\.verifications[[:space:]]*$')
+if [[ ${CONSUMERS:-0} -ge 3 ]]; then
+  pass=$((pass + 1)); echo "PASS  AC-1-consumers $CONSUMERS consumers on matchgw.verifications"
+else
+  fail=$((fail + 1)); echo "FAIL  AC-1-consumers expected >= 3 consumers on matchgw.verifications, got ${CONSUMERS:-0}"
+fi
+matcher_readiness() { # container-id -> HTTP response text (bare JRE image: bash /dev/tcp)
+  docker exec -i "$1" bash -c 'exec 3<>/dev/tcp/127.0.0.1/8081; printf "GET /actuator/health/readiness HTTP/1.0\r\nHost: localhost\r\n\r\n" >&3; cat <&3'
+}
+READY_COUNT=0 MATCHER_COUNT=0
+for cid in $(docker compose ps -q matcher); do
+  MATCHER_COUNT=$((MATCHER_COUNT + 1))
+  matcher_readiness "$cid" 2>/dev/null | grep -q '"status":"UP"' && READY_COUNT=$((READY_COUNT + 1))
+done
+if [[ $MATCHER_COUNT -ge 3 && $READY_COUNT -eq $MATCHER_COUNT ]]; then
+  pass=$((pass + 1)); echo "PASS  AC-1-ready    $READY_COUNT/$MATCHER_COUNT matcher replicas ready"
+else
+  fail=$((fail + 1)); echo "FAIL  AC-1-ready    $READY_COUNT/$MATCHER_COUNT matcher replicas ready (expected >= 3, all UP)"
+fi
+
 # --- steps 7-9: threshold, erasure, idempotency, metrics -----------------------
 RUN="$(date +%s)$RANDOM"
 JSON='Content-Type: application/json'

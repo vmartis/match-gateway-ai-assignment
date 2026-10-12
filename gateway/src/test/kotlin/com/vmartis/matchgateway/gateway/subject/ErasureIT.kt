@@ -92,18 +92,16 @@ class ErasureIT : GatewayIntegrationTest() {
     private fun insertPending(
         tenant: String,
         subject: String,
-        attempts: Int = 0,
     ): UUID {
         val id = UUID.randomUUID()
         jdbc
             .sql(
-                "insert into verification (id, tenant_id, subject_id, status, probe, attempts) " +
-                    "values (:id, :t, :s, 'PENDING', :probe, :attempts)",
+                "insert into verification (id, tenant_id, subject_id, status, probe) " +
+                    "values (:id, :t, :s, 'PENDING', :probe)",
             ).param("id", id)
             .param("t", tenant)
             .param("s", subject)
             .param("probe", TestTemplates.unitBytes(3))
-            .param("attempts", attempts)
             .update()
         return id
     }
@@ -117,8 +115,8 @@ class ErasureIT : GatewayIntegrationTest() {
         val scored = status != "FAILED"
         jdbc
             .sql(
-                "insert into verification (id, tenant_id, subject_id, status, probe, score, threshold, reason, attempts, decided_at) " +
-                    "values (:id, :t, :s, :status, null, :score, :threshold, :reason, 1, :decidedAt)",
+                "insert into verification (id, tenant_id, subject_id, status, probe, score, threshold, reason, decided_at) " +
+                    "values (:id, :t, :s, :status, null, :score, :threshold, :reason, :decidedAt)",
             ).param("id", id)
             .param("t", tenant)
             .param("s", subject)
@@ -273,20 +271,13 @@ class ErasureIT : GatewayIntegrationTest() {
         assertThat(pendingRow["status"]).isEqualTo("FAILED")
         assertThat(pendingRow["reason"]).isEqualTo("SUBJECT_ERASED")
         assertThat(pendingRow["probe"]).isNull()
-        assertThat(pendingRow["lease_token"]).isNull()
-        assertThat(pendingRow["lease_until"]).isNull()
         assertThat(pendingRow["decided_at"]).isNotNull()
     }
 
     @Test
-    fun `AC-47 a claimed pending verification is also finished as SUBJECT_ERASED with lease cleared`() {
+    fun `AC-47 a pending verification (a job held by a consumer is indistinguishable in the DB) is finished as SUBJECT_ERASED`() {
         enrol("s1", 0)
-        val pending = insertPending(tenantA, "s1", attempts = 1)
-        jdbc
-            .sql("update verification set lease_token = :t, lease_until = now() + interval '10 seconds' where id = :id")
-            .param("t", UUID.randomUUID())
-            .param("id", pending)
-            .update()
+        val pending = insertPending(tenantA, "s1")
 
         assertThat(erase("s1").status).isEqualTo(204)
 
@@ -294,8 +285,7 @@ class ErasureIT : GatewayIntegrationTest() {
         assertThat(r["status"]).isEqualTo("FAILED")
         assertThat(r["reason"]).isEqualTo("SUBJECT_ERASED")
         assertThat(r["probe"]).isNull()
-        assertThat(r["lease_token"]).isNull()
-        assertThat(r["lease_until"]).isNull()
+        assertThat(r["decided_at"]).isNotNull()
     }
 
     @Test
@@ -442,39 +432,36 @@ class ErasureIT : GatewayIntegrationTest() {
 
     // ---------------------------------------------------------------- AC-49
 
-    private val claimedLease =
-        "update verification set attempts = attempts + 1, lease_token = :token, " +
-            "lease_until = now() + interval '10 seconds' where id = :id"
-
     @Test
-    fun `AC-49 a late matcher write after claim and erasure is a guarded no-op and the row stays SUBJECT_ERASED`() {
+    fun `AC-49 a late matcher write after load and erasure is a guarded no-op and the row stays SUBJECT_ERASED`() {
         enrol("s1", 0)
         val pending = insertPending(tenantA, "s1")
-        val token = UUID.randomUUID()
-        jdbc
-            .sql(claimedLease)
-            .param("token", token)
-            .param("id", pending)
-            .update()
+        // The matcher has loaded the job (JobQueue.load WHERE id = :id AND status = 'PENDING'): the row is still PENDING.
+        val loaded =
+            jdbc
+                .sql("SELECT id FROM verification WHERE id = :id AND status = 'PENDING'")
+                .param("id", pending)
+                .query(UUID::class.java)
+                .list()
+        assertThat(loaded).containsExactly(pending)
 
         assertThat(erase("s1").status).isEqualTo(204)
 
-        // JobQueue.complete() of the matcher, verbatim guarded terminal write with MATCH values.
+        // JobQueue.terminal() of the matcher, with the same WHERE guard as guarded terminal write with MATCH values.
         val updated =
             jdbc
                 .sql(
                     """
                     UPDATE verification
                        SET status = :status, score = :score, threshold = :threshold, reason = :reason,
-                           probe = NULL, lease_token = NULL, lease_until = NULL, decided_at = now()
-                     WHERE id = :id AND status = 'PENDING' AND lease_token = :token
+                           probe = NULL, decided_at = now()
+                     WHERE id = :id AND status = 'PENDING'
                     """.trimIndent(),
                 ).param("status", "MATCH")
                 .param("score", 0.99)
                 .param("threshold", 0.6)
                 .param("reason", null)
                 .param("id", pending)
-                .param("token", token)
                 .update()
 
         assertThat(updated).isZero()
@@ -489,20 +476,20 @@ class ErasureIT : GatewayIntegrationTest() {
     }
 
     @Test
-    fun `AC-49 an unclaimed pending verification is never claimable after erasure`() {
+    fun `AC-49 a pending verification is never loadable by the matcher after erasure`() {
         enrol("s1", 0)
         val pending = insertPending(tenantA, "s1")
 
         assertThat(erase("s1").status).isEqualTo(204)
 
-        // The WHERE filter of JobQueue.claim().
-        val claimable =
+        // The WHERE filter of JobQueue.load().
+        val loadable =
             jdbc
-                .sql(
-                    "select id from verification where status = 'PENDING' and attempts < 3 and (lease_until is null or lease_until < now())",
-                ).query(UUID::class.java)
+                .sql("SELECT id FROM verification WHERE id = :id AND status = 'PENDING'")
+                .param("id", pending)
+                .query(UUID::class.java)
                 .list()
-        assertThat(claimable).doesNotContain(pending)
+        assertThat(loadable).isEmpty()
         assertThat(row(pending)["status"]).isEqualTo("FAILED")
     }
 

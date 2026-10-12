@@ -1,23 +1,41 @@
 # Match Gateway
 
 Multi-tenant asynchronous 1:1 face-template verification: a JWT-protected `gateway` REST API and horizontally scaled `matcher`
-workers over PostgreSQL. Specification: [docs/SPEC.md](docs/SPEC.md); design: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and
+workers, connected through RabbitMQ (transactional outbox, quorum queue) with PostgreSQL as the source of truth. Specification: [docs/SPEC.md](docs/SPEC.md); design: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and
 [docs/adr/](docs/adr/); plan and progress: [docs/PLAN.md](docs/PLAN.md); AI usage: [docs/AI_LOG.md](docs/AI_LOG.md).
-
-> Work in progress – API usage, evaluation and load-test results are added as the plan steps land.
 
 ## Run
 
 ```
-docker compose up --build        # postgres, gateway (http://127.0.0.1:8080) and 3 matcher replicas
+docker compose up --build        # postgres, rabbitmq, gateway (http://127.0.0.1:8080) and 3 matcher replicas
 curl http://127.0.0.1:8080/actuator/health
 TOKEN=$(./scripts/token.sh bank-alpha client-1 "enroll verify admin")   # dev RS256 token, 15 min
 docker compose down -v           # also deletes the generated DB password and all data
 ```
 
-Prerequisite: Docker with Compose v2 – no local JDK needed. The DB password is generated on first start into the `dbcreds`
-volume and never leaves the compose network; `down -v` resets it together with the data (removing only one of the two
-volumes leaves postgres with a password it no longer accepts).
+Prerequisite: Docker with Compose v2 – no local JDK needed. The DB and broker passwords are generated on first start into the
+`dbcreds` / `mqcreds` volumes and never leave the compose network; `down -v` resets them together with the data (removing only
+some of the volumes leaves postgres or RabbitMQ with a password it no longer accepts). Neither the database nor the broker
+publishes a port. A cold start (no-cache image build + start until every service is healthy) took 117 s on the machine below
+(99 s build, 18 s start; AC-1: ≤ 3 min).
+
+## Load test and evaluation (AC-53..AC-58)
+
+Measured 2026-10-12 on an Apple M3 Pro (12 cores, 36 GiB RAM), macOS 26.6.2, Docker Desktop 29.8.0 (VM: 12 CPUs, 7.65 GiB).
+Compose limits: gateway 768 MiB, each of the 3 matchers 512 MiB, RabbitMQ 512 MiB, `pids_limit` 512; no CPU limits; PostgreSQL
+unlimited. Fresh stack (empty volumes), `./loadtest/run.sh` (k6 `constant-arrival-rate`, 300 `POST /v1/verifications`/s for
+60 s across 3 tenants, unique keys) and `python3 eval/eval.py` (5 000 pairs).
+
+| NFR | Target | Measured | Met |
+|---|---|---|---|
+| NFR-1 throughput + errors | 300/s for 60 s, error rate < 0.1 % | 18 001 submits accepted (~300.0/s), 0 dropped iterations, error rate 0.000 % | yes |
+| NFR-2 time to final status | p95 ≤ 500 ms | server-side p95 of `decidedAt − createdAt` 58.5 ms (matcher histogram, 18 001 decisions); k6-polled p95 108.3 ms (10 % sample, 50 ms poll) | yes |
+| NFR-3 submit latency | POST p99 ≤ 100 ms | p95 14.6 ms, p99 46.2 ms | yes |
+
+Biometric evaluation (identical numbers on every run so far): at the default threshold 0.5 FMR 0.5507 % (14 / 2 542 impostors),
+FNMR 7.6485 % (188 / 2 458 genuines). The lowest threshold with FMR ≤ 0.1 % is 0.651113 (FMR 0.0787 %, FNMR 10.6184 %); its 95 %
+upper bound on FMR is 0.2475 % (Clopper-Pearson), so 2 542 impostors cannot *prove* FMR ≤ 0.1 % at that threshold. 14 impostor
+pairs score ≥ 0.5 (look-alikes); 261 genuines fall below the recommended threshold (poor captures).
 
 ## Known limitations
 
@@ -28,10 +46,10 @@ Accepted review findings and deliberate scope cuts, each with the risk and what 
 | Public `GET /actuator/health` runs the full health check (incl. a DB connection) for anonymous callers (security review, step 1a) | Anonymous health floods compete with API traffic for the Hikari pool; no rate limiting (D-2) | Cache the status for ~1 s or expose only a `ping` group publicly; per-client rate limiting at the edge |
 | Build plugin classpath (Kotlin, Boot, dependency-management, ktlint plugins) is not dependency-locked or osv-scanned; ktlint tool configurations are excluded on purpose (D-20) | A compromised build plugin runs at build time (not shipped in images) | Lock the buildscript/settings classpath and scan it as well |
 | Gateway and matcher connect as the bootstrap role `matchgw`, which is a **Postgres superuser** (security review 1b proved `COPY … FROM PROGRAM 'id'` runs as uid 999 in the DB container) | A future SQL injection or a compromised app container would get full data access and command execution in the DB container | Split roles: superuser only for bootstrap, a schema-owner role for Flyway, NOSUPERUSER DML-only login roles per app (second generated password + `docker-entrypoint-initdb.d` script) |
-| The INV-1 trigger (V2) blocks only UPDATEs of decided rows: the owner/superuser role can disable it, and DELETE-then-INSERT or TRUNCATE can still replace or remove a decided row (security review, step 6) | Integrity of decisions against someone holding the app's DB credentials; not reachable via the API (gateway inserts only PENDING rows with server UUIDs, matcher writes are status/lease guarded) | Split roles as above; app roles get no TRUNCATE and no ownership; BEFORE INSERT trigger forcing `status = 'PENDING'`; DELETE only through an erasure role |
+| The INV-1 trigger (V2) blocks only UPDATEs of decided rows: the owner/superuser role can disable it, and DELETE-then-INSERT or TRUNCATE can still replace or remove a decided row (security review, step 6) | Integrity of decisions against someone holding the app's DB credentials; not reachable via the API (gateway inserts only PENDING rows with server UUIDs, matcher writes are status guarded) | Split roles as above; app roles get no TRUNCATE and no ownership; BEFORE INSERT trigger forcing `status = 'PENDING'`; DELETE only through an erasure role |
 | Spring's own DEBUG loggers (`org.springframework.web`, `org.springframework.security`) log request URLs and Jackson parse messages, which echo client input; the leakage scan (AC-41) runs at the shipped log levels plus DEBUG for our code (D-25) | Enabling those loggers in production would write any hostile input – including template data a client misplaced into a URL or a wrong field – to the logs | Never enable them in production (log-level changes reviewed like code); ship logs to a store with access control and retention; optionally a log-pipeline redaction stage |
-| Erasure and the matcher's reaper are both multi-row UPDATEs on `verification` that may lock a subject's pending rows in different orders (code review step 8, not reproduced) | With ≥ 2 reapable pending rows of the subject at the same moment, PostgreSQL may abort the erasure with a deadlock → 500; the transaction rolls back atomically (tested) and a retry succeeds | Lock the subject's pending rows first in a fixed order (`SELECT … ORDER BY id FOR UPDATE`) in both statements, or retry on SQLSTATE 40P01 |
-| A verification submitted while an erasure commits (AM-9) can stay PENDING with its probe after the `204`; it ends `SUBJECT_NOT_ENROLLED` within ~150 ms (security review step 8, reproduced). Suspected, not reproduced: if the subject is re-enrolled before a matcher claims it, it is scored against the new template | Probe of an erased subject outlives the `204` briefly (longer if all matchers are down); possible decision against a re-enrolled subject | Serialise submit and erasure per (tenant, subject), e.g. `pg_advisory_xact_lock` in both transactions |
+| Erasure is a multi-row UPDATE of a subject's pending rows while matchers write single rows (code review step 8, revised step 14: the reaper is gone, matchers hold at most one row lock and never lock `subject`) | A deadlock is no longer expected; if PostgreSQL ever aborts an erasure (e.g. 40P01) the client gets a 500, the transaction rolls back atomically (tested) and a retry succeeds | Retry erasure on SQLSTATE 40P01 |
+| A verification submitted while an erasure commits (AM-9) can stay PENDING with its probe after the `204`; it ends `SUBJECT_NOT_ENROLLED` within ~150 ms (security review step 8, reproduced). Suspected, not reproduced: if the subject is re-enrolled before a matcher consumes it, it is scored against the new template | Probe of an erased subject outlives the `204` briefly (longer if all matchers are down); possible decision against a re-enrolled subject | Serialise submit and erasure per (tenant, subject), e.g. `pg_advisory_xact_lock` in both transactions |
 | Erased templates and probes physically remain in PostgreSQL dead tuples, WAL and backups until VACUUM/recycling (security review step 8) | Not reachable through SQL or the API, but present on disk; encryption at rest is a Won't (D-2) | Aggressive autovacuum on `template_version`/`verification`, backup retention aligned with erasure, encryption at rest / crypto-shredding per tenant |
 | Expired idempotency rows (keyed fingerprints) are never deleted, only overwritten when the same key is reused; no rate limit (ADR-008, D-2; security review step 9) | Fingerprints derived from biometric data stay indefinitely; a caller with `verify` can grow the table with unique keys (~0.6 KB per key) | Scheduled `DELETE FROM idempotency_key WHERE created_at < now() - interval '24 hours'`; per-tenant rate limit |
 | Erasing a subject that was never enrolled returns `404` and leaves the fingerprints of verifications submitted against that id (outcome `SUBJECT_NOT_ENROLLED`) (security review step 9) | A replay of such a key still returns the old id; the fingerprints cannot be removed through the API | Delete the subject's fingerprints (and any probes) before the `404` early return – needs a SPEC/A-S3 decision because the response would stay `404` while data changes |
@@ -44,13 +62,14 @@ Accepted review findings and deliberate scope cuts, each with the risk and what 
 | AMQP inside the compose network is plain text (no TLS on 5671) (security review step 11) | Broker credentials and verification ids cross the Docker bridge unencrypted; single-host only | TLS listener + client verification for any multi-host deployment |
 | The broker password is applied only when RabbitMQ's data volume is empty: deleting `mqcreds` but keeping `mqdata` generates a new password the broker does not know (security review step 11) | Apps fail to authenticate (availability, not confidentiality); `docker compose down -v` resets both | Regenerate only when both volumes are fresh, or set the password with `rabbitmqctl change_password` at startup |
 | Plain docker compose does not restart unhealthy containers (code review step 11) | A hung-but-connected matcher keeps its message until its connection closes; the per-message deadline (step 13) covers stalls inside processing, not a frozen JVM | Orchestrator liveness restarts (Kubernetes) or an autoheal sidecar |
-| The job queue has no `x-max-length`; until step 13 nothing consumes it (security/code review step 12) | Messages accumulate on the broker volume; a disk or memory alarm would block publishers (the outbox keeps the jobs) | Decide a max length before step 13 (queue arguments are immutable: changing them means re-declaring the queue) |
+| The job queue has no `x-max-length` (`x-overflow: reject-publish` therefore never triggers) (security/code reviews steps 12–14) | During a long matcher outage messages accumulate on the broker volume; a disk or memory alarm is the only backpressure and blocks publishers (the outbox keeps the jobs) | Size and set a max length (queue arguments are immutable: changing them means re-declaring the queue) |
 | A publish to a hung broker is bounded at ~20 s (amqp-client handshake 10 s default + channel RPC 5 s + confirm 5 s); eager publishes are capped at 64 concurrent tasks, the rest wait for the relay (review step 12) | During an outage jobs are delivered up to ~20 s after the broker returns; duplicates remain possible if a confirm is lost | Configure the client handshake timeout via a `ConnectionFactoryCustomizer`; the matcher's guarded write makes duplicates harmless (step 13) |
 | RabbitMQ counts every return after a connection or channel loss toward the 3 deliveries; Spring restarts consumers in a staggered way after a reconnect (step 13). With prefetch 1 only the job each consumer is processing is affected | A network blip that makes a replica reconnect repeatedly can fail its in-flight job with MAX_ATTEMPTS although the decision never failed | A larger delivery limit with an application-level attempt count, or retry MAX_ATTEMPTS jobs whose failures were all connection losses |
 | A processing error requeues immediately (no backoff) (code review step 13) | A transient DB error can use all 3 deliveries in milliseconds and end a job MAX_ATTEMPTS | Delayed retry (e.g. a retry queue with per-message TTL) for errors classified as transient |
 | Anyone with the shared broker credentials can publish an id to the dead-letter exchange and end any tenant's pending verification as FAILED/MAX_ATTEMPTS, or purge the job queue (security review step 13) | Needs the broker password (same containers as the DB credentials today); outcomes of decided jobs cannot be changed (guarded write, V2 trigger) | Separate broker users (gateway write-only on the job exchange, matchers read-only on the queues); require an `x-death` header with reason `delivery_limit` in the dead-letter consumer |
 | No reconciler for lost messages: after a confirmed publish the message is the only trigger (security review step 13) | A purged queue or lost broker volume leaves verifications PENDING with their probe (NFR-5) | Periodic job that re-publishes or fails PENDING rows older than N seconds |
 | Poison job messages (not a 36-byte canonical id) are acked and logged with one constant WARN each (security review step 13) | Log flooding by a broker-credential holder; no attacker bytes are logged | Count drops in a metric and rate-limit the WARN |
+| During the eval's submit burst 10 of 5 000 jobs were decided ~10 s later than the rest (eval 22 s instead of ~12 s); not seen under k6's constant 300/s. Likely cause (not confirmed – per-publish deferrals log at DEBUG): eager publishes rejected by the 64-task executor bound, delivered by the outbox relay after its 15 s age | Tail latency for bursts above the publish concurrency bound; no job is lost | Metric for deferred/rejected eager publishes; shorter relay age or a larger bound sized from measurements |
 | Schema CHECKs on `verification.subject_id`, `idempotency_key.idem_key` and `tenant_id` formats are left to the API layer | Defence in depth only – the API validates these inputs | Add matching CHECK constraints |
 | Base image `eclipse-temurin:25-jre` (Ubuntu 26.04) carries OS-package CVEs: 86 advisories in 19 packages, 0 critical, 15 fixable (Go stdlib in `pebble`, freetype, libpng) – none in our layers (security review 1b, `osv-scanner scan image`) | Exploitable only via those OS components, which the JVM app does not invoke | Rebuild on new base releases (digest bump); evaluate a chiseled/distroless JRE (needs an ADR – healthchecks use bash) |
 | The API is plain HTTP (no TLS in compose); bound to 127.0.0.1 only | Bearer tokens in cleartext if the port were exposed beyond localhost | Terminate TLS at an ingress/reverse proxy; enable HSTS there |

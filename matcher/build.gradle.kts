@@ -32,3 +32,12 @@ dependencies {
 tasks.named<org.springframework.boot.gradle.tasks.bundling.BootJar>("bootJar") {
     archiveFileName.set("app.jar")
 }
+
+// Matcher ITs apply the gateway's Flyway migrations from the filesystem: a migration change must re-run them (code review step 14).
+tasks.withType<Test>().configureEach {
+    inputs
+        .dir(
+            "../gateway/src/main/resources/db/migration",
+        ).withPropertyName("gatewayMigrations")
+        .withPathSensitivity(PathSensitivity.RELATIVE)
+}
