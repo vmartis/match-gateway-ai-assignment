@@ -35,3 +35,6 @@ loadtest/results/
 
 ### Python bytecode ###
 __pycache__/
+
+### ZAP scan output (scripts/owasp-scan.sh) ###
+zap-report/

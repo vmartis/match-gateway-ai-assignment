@@ -48,5 +48,21 @@ risks are listed in README "Known limitations".
 | API10 | Unsafe Consumption of APIs | covered | Broker messages are untrusted input: canonical-UUID only, tenant from the DB row, guarded write (`MatcherIT` poison bodies, `DecisionProcessorIT`) | Dead-letter consumer trusts the queue (no `x-death` check) |
 
 ## ZAP results
-**Not run** (ship-check 2026-10-12): `./scripts/owasp-scan.sh` still does not exist in the repository, so no ZAP baseline/API scan
-was executed. No ZAP results are claimed in the matrix above.
+
+`./scripts/owasp-scan.sh` – OWASP ZAP API scan (passive + active), image `ghcr.io/zaproxy/zaproxy:stable` pinned by digest,
+against the running compose stack (`http://gateway:8080` on the compose network), driven by `scripts/zap/openapi.yaml`
+(5 endpoints + health, 12 imported URLs), authenticated with a dev token of a dedicated tenant `zap-scan`
+(`ZAP_AUTH_HEADER_VALUE`, scopes enroll verify admin).
+
+Run 2026-10-12 (commit 9246788 + script): **FAIL 0, WARN 1, PASS 118** (exit 0).
+
+| Alert | Risk | Where | Assessment |
+|---|---|---|---|
+| 90004 Cross-Origin-Resource-Policy header missing or invalid | Low | `/actuator/health`, `/v1/tenant/threshold` | Valid: responses carry no `Cross-Origin-Resource-Policy`. Low impact for a JSON API without browser clients; fix proposal: `Cross-Origin-Resource-Policy: same-origin` via Spring Security's header writer |
+| 100000 Client error response code | Info | probes of cloud-metadata paths (`/latest/meta-data/`, `/computeMetadata/v1/`) | Expected: denied / not found |
+| 10049 Non-storable content | Info | `/v1/**`, health | Expected: `Cache-Control: no-store` is intentional |
+
+Coverage limits: authentication worked (the scan's threshold PUT was stored), but enrolment and verification requests never
+passed input validation – no subject or verification was created for `zap-scan` – so for those endpoints ZAP exercised the
+validation/error paths, not the happy path (likely cause, not confirmed: ZAP generates its own body values instead of the
+684-character template example). Full reports: `zap-report/report.{html,json,md}` (git-ignored).
