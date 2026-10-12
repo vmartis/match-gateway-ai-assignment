@@ -20,33 +20,33 @@ See docs/ARCHITECTURE.md § Threat model.
 
 ## OWASP matrix
 
-Refreshed by /ship-check on 2026-10-11 (commit c76b0d3). Evidence = automated tests from the clean run (517 tests, 0 failed),
-`scripts/acceptance.sh` on a fresh clone (66/66) and the per-step security reviews (live probes, recorded in docs/AI_LOG.md).
-Residual risks are listed in README "Known limitations".
+Refreshed by /ship-check on 2026-10-12 (commit faf98ce, RabbitMQ design D-28/ADR-009). Evidence = automated tests of the clean
+run, `scripts/acceptance.sh` on a fresh clone (70/70) and the per-step security reviews (live probes, docs/AI_LOG.md). Residual
+risks are listed in README "Known limitations".
 
 | Id | Category | Status | Evidence (test / ZAP rule / review) | Notes |
 |---|---|---|---|---|
-| A01 | Broken Access Control | covered | `TenantIsolationIT`, `TenantIsolationMatcherIT`, `ErasureIT` (API1 AC-37), `IdempotencyIT` (AC-20), `ThresholdIT` (tenant from JWT only), `ScopeAuthorizationIT`; acceptance AC-33/AC-20/AC-7 | Tenant in every SQL statement from the JWT; other tenants' resources → identical 404 |
-| A02 | Security Misconfiguration | covered | `SecurityHeadersIT`, `LeakageIT` (AC-44 headers on every /v1 status), `HealthEndpointIT` (only health exposed), `TransportHardeningIT`; review step 10: 30+ actuator path variants → 401/403/400 | Gap: firewall-rejected 400s lack nosniff/no-store; Tomcat-level 400s are HTML; no TLS/HSTS in compose (README) |
-| A03 | Software Supply Chain Failures | covered | `verify.sh`: osv-scanner over all Gradle lockfiles ("No issues found"), dependency locking, base images and k6 pinned by digest | Build-plugin classpath not locked; base-image OS CVEs (README) |
-| A04 | Cryptographic Failures | covered | `JwtAuthenticationIT` (RS256 pinned, alg=none and HS256 confusion rejected), `FingerprinterTest` + `IdempotencyIT` (HMAC-SHA256, 32-byte key, constant-time compare), `DevTokenTest` | Keys generated at first start, never in git (gitleaks clean incl. history); encryption at rest = Won't (D-2) |
-| A05 | Injection | covered | Parameterised `JdbcClient` only; `EnrollmentIT`/`VerificationIT`/`ThresholdIT` hostile inputs; StrictJsonConfig (no coercion, duplicate keys rejected); review step 9: SQL payload in Idempotency-Key stored verbatim | No dynamic SQL; subject id regex at the boundary |
-| A06 | Insecure Design | covered | `ExactlyOnceIT` (AC-34/35/36, V2 immutability trigger), `ErasureIT` (atomicity, AC-49 ordering), `IdempotencyIT` (DB-uniqueness concurrency) | Residual: AM-9 submit/erase race, possible reaper/erasure deadlock (README) |
-| A07 | Authentication Failures | covered | `JwtAuthenticationIT` (12 cases incl. expired, nbf, wrong iss/aud, missing tenant_id/iat, lifetime > 15 min), acceptance AC-6 | No token endpoint; dev tokens only (ADR-004) |
-| A08 | Software or Data Integrity Failures | covered | V2 trigger (`ExactlyOnceIT` INV-1), guarded terminal writes, duplicate JSON keys rejected (`VerificationIT`, acceptance HOSTILE-verify-dupkey) | Superuser DB role can disable the trigger (README) |
-| A09 | Security Logging & Alerting Failures | covered | `LeakageIT` (logs + bodies of every endpoint scanned for templates/tokens, with a capture canary), `RequestRedactionTest`, `TenantIsolationMatcherIT` (matcher log scan incl. decoded shapes), `MetricsIT` (no tenant/subject labels) | Scan at shipped log levels (D-25); no alerting rules shipped |
-| A10 | Mishandling of Exceptional Conditions | covered | Single advice → constant problem bodies; `TransportHardeningIT`, `VerificationIT` (non-ASCII key → 400, no ERROR log), `ErasureIT` (fault injection → 500, rolled back), `MatcherIT` (poison template → MAX_ATTEMPTS) | — |
-| API1 | Broken Object Level Authorization | covered | `TenantIsolationIT` (AC-37/39 byte-identical 404), `ErasureIT` BOLA, `ThresholdIT` BOLA, `IdempotencyIT` AC-20 | — |
-| API2 | Broken Authentication | covered | `JwtAuthenticationIT`, `ErasureIT`/`ThresholdIT` invalid-token sets, `LeakageIT` (12 token kinds on every endpoint) | — |
-| API3 | Broken Object Property Level Authorization | covered | DTOs at the boundary; `VerificationIT` (exact response keys, `reason` only when FAILED), `IdempotencyIT` (replay body exactly `{verificationId,status}`), mass-assignment tests (tenant fields in bodies ignored) | — |
-| API4 | Unrestricted Resource Consumption | gap (partial) | 8 KB body limit (`TransportHardeningIT`, acceptance 413s), key/id length limits, strict template length; Hikari pool caps | No rate limiting, no cleanup of expired idempotency rows (D-2, README) |
-| API5 | Broken Function Level Authorization | covered | `ScopeAuthorizationIT` (per-path rules for all methods incl. HEAD, denyAll fallback), `ThresholdIT`/`ErasureIT` scope tests, acceptance AC-7/API5-HEAD | 403 before the body is read (D-18) |
-| API6 | Unrestricted Access to Sensitive Business Flows | gap (accepted) | Admin scope required for threshold and erasure | No rate limit or anti-automation; score oracle (MC-7) documented in ARCHITECTURE |
-| API7 | Server Side Request Forgery | N/A | No outbound HTTP from gateway or matcher | eval refuses redirects (`test_eval.py::NoRedirectTest`) |
-| API8 | Security Misconfiguration | covered | Same as A02; matcher port 8081 unpublished (review step 10), CORS allowlist empty, CSRF disabled per ADR-005 | Matcher prometheus unauthenticated inside the compose network (D-27) |
-| API9 | Improper Inventory Management | covered | ARCHITECTURE API table matches the endpoints; deny-by-default (`ScopeAuthorizationIT` unmapped → 403); `HealthEndpointIT` | SPEC DELETE error list still lacks 400 (D-26, proposed change) |
-| API10 | Unsafe Consumption of APIs | N/A | No third-party API consumed | — |
+| A01 | Broken Access Control | covered | `TenantIsolationIT`, `TenantIsolationMatcherIT`, `ErasureIT` (API1 AC-37), `IdempotencyIT` (AC-20), `ThresholdIT`, `ScopeAuthorizationIT`, `DecisionProcessorIT` (tenant from the DB row, never from a message); acceptance AC-33/AC-20/AC-7 | A forged job id cannot cross tenants: the matcher takes tenant/subject from the PENDING row |
+| A02 | Security Misconfiguration | covered | `SecurityHeadersIT`, `LeakageIT` (AC-44), `HealthEndpointIT`, `TransportHardeningIT`, `BrokerTopologyIT`/`BrokerDownIT`; reviews step 11: broker unpublished, generated credentials, no guest/admin, no plugins, Erlang distribution on loopback, hardened container | Gaps: firewall 400s lack nosniff/no-store; no TLS/HSTS in compose; AMQP plaintext inside the network |
+| A03 | Software Supply Chain Failures | covered | `verify.sh`: osv-scanner over all lockfiles ("No issues found"), dependency locking, amqp-client raised to 5.37.0 (Boot BOM 5.30.0 had 10 advisories), images pinned by digest (postgres, rabbitmq 4.3, k6) | Build-plugin classpath not locked; base-image OS CVEs |
+| A04 | Cryptographic Failures | covered | `JwtAuthenticationIT` (RS256 pinned, alg=none and HS256 confusion rejected), `FingerprinterTest` + `IdempotencyIT` (HMAC-SHA256, constant-time compare), `DevTokenTest` | Keys and broker/DB passwords generated at first start, never in git (gitleaks clean incl. history); no TLS on AMQP/JDBC inside compose; encryption at rest = Won't |
+| A05 | Injection | covered | Parameterised `JdbcClient` only; hostile-input ITs; StrictJsonConfig; acceptance HOSTILE-* | No dynamic SQL; broker messages are parsed as a canonical UUID only |
+| A06 | Insecure Design | covered | `OutboxIT`/`OutboxRelayIT` (no lost job: broker down, hung, unroutable, rollback), `ExactlyOnceIT` (500 messages × 3 consumers, duplicates, stale writer), `MatcherIT`/`MatcherStallIT` (crash, stall, stuck consumer), `ErasureIT`/`ErasureOrderingIT` | Residual: no reconciler for messages lost after a confirmed publish; AM-9 submit/erase race; burst tail latency via the relay |
+| A07 | Authentication Failures | covered | `JwtAuthenticationIT` (12 cases), acceptance AC-6 | No token endpoint; dev tokens only (ADR-004) |
+| A08 | Software or Data Integrity Failures | covered | Guarded terminal write + V2 trigger (`ExactlyOnceIT`, `JobQueueIT`), duplicate JSON keys rejected, publisher confirms before the outbox row is deleted (`OutboxIT`) | Shared broker identity can forge dead letters (forced MAX_ATTEMPTS) or purge the queue; superuser DB role can disable the trigger |
+| A09 | Security Logging & Alerting Failures | covered | `LeakageIT` (with canary), `RequestRedactionTest`, `TenantIsolationMatcherIT` (matcher logs incl. failure paths), `MetricsIT` (no tenant/subject labels); consumers log only ids + exception classes | Scan at shipped log levels (D-25); poison messages log one WARN each; no alerting rules |
+| A10 | Mishandling of Exceptional Conditions | covered | `TransportHardeningIT`, `VerificationIT` (non-ASCII key → 400), `ErasureIT` (fault injection), `OutboxIT` (broker hung: bounded), `MatcherStallIT` (deadline), `DeadLetterListenerIT` (failing writes retried, never dropped) | Reconnect churn can fail an in-flight job with MAX_ATTEMPTS |
+| API1 | Broken Object Level Authorization | covered | `TenantIsolationIT` (AC-37/39), `ErasureIT` BOLA, `ThresholdIT` BOLA, `IdempotencyIT` AC-20 | — |
+| API2 | Broken Authentication | covered | `JwtAuthenticationIT`, invalid-token sets in `ErasureIT`/`ThresholdIT`, `LeakageIT` (12 token kinds) | — |
+| API3 | Broken Object Property Level Authorization | covered | DTOs at the boundary; `VerificationIT` (exact keys), `IdempotencyIT` (replay body), mass-assignment tests; job message = id only (`OutboxIT` A09) | — |
+| API4 | Unrestricted Resource Consumption | gap (partial) | 8 KB body limit, length limits; bounded publish executor + broker timeouts (`OutboxIT`); prefetch 1 + 36-byte body check + broker `max_message_size` 4096 | No rate limiting; no queue max length; expired idempotency rows never cleaned |
+| API5 | Broken Function Level Authorization | covered | `ScopeAuthorizationIT` (per-path rules for all methods, denyAll), scope tests in `ThresholdIT`/`ErasureIT` | 403 before the body is read (D-18) |
+| API6 | Unrestricted Access to Sensitive Business Flows | gap (accepted) | Admin scope for threshold and erasure | No anti-automation; score oracle (MC-7) |
+| API7 | Server Side Request Forgery | N/A | No outbound HTTP from gateway or matcher; broker host is fixed config | eval refuses redirects (`test_eval.py::NoRedirectTest`) |
+| API8 | Security Misconfiguration | covered | Same as A02; matcher port 8081 and broker unpublished; CORS allowlist empty; CSRF disabled per ADR-005 | Matcher prometheus unauthenticated inside the compose network (D-27) |
+| API9 | Improper Inventory Management | covered | ARCHITECTURE API table + protocol + data model match the code (reviews steps 13–14); deny-by-default | — |
+| API10 | Unsafe Consumption of APIs | covered | Broker messages are untrusted input: canonical-UUID only, tenant from the DB row, guarded write (`MatcherIT` poison bodies, `DecisionProcessorIT`) | Dead-letter consumer trusts the queue (no `x-death` check) |
 
 ## ZAP results
-**Not run** (ship-check 2026-10-11): `./scripts/owasp-scan.sh` does not exist in the repository, so no ZAP baseline/API scan
+**Not run** (ship-check 2026-10-12): `./scripts/owasp-scan.sh` still does not exist in the repository, so no ZAP baseline/API scan
 was executed. No ZAP results are claimed in the matrix above.
