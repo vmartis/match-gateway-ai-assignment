@@ -19,6 +19,96 @@ some of the volumes leaves postgres or RabbitMQ with a password it no longer acc
 publishes a port. A cold start (no-cache image build + start until every service is healthy) took 117 s on the machine below
 (99 s build, 18 s start; AC-1: ≤ 3 min).
 
+## Test
+
+```
+./scripts/verify.sh                 # full gate: ktlint, build, all tests (Testcontainers: Postgres + RabbitMQ), gitleaks, osv-scanner
+./gradlew test                      # tests only; ./gradlew :gateway:securityTest for the security-tagged subset
+./scripts/acceptance.sh             # black-box checks against the running stack (docker compose up first)
+python3 eval/eval.py                # biometric evaluation through the API (FMR/FNMR, recommended threshold)
+./loadtest/run.sh [--smoke]         # k6 load test on the compose network (full: 300/s for 60 s)
+```
+
+`verify.sh` needs Docker (Testcontainers) and, for the scans, `gitleaks` and `osv-scanner` on the PATH (skipped with a warning
+locally if missing). The AC → test matrix is in [docs/EVALS.md](docs/EVALS.md).
+
+## API usage
+
+All `/v1` endpoints need a bearer token with the right scope; the tenant always comes from the token (`tenant_id` claim).
+Errors are RFC 9457 problem details (`application/problem+json`) with constant bodies.
+
+```
+TOKEN=$(./scripts/token.sh bank-alpha client-1 "enroll verify admin")
+B=http://127.0.0.1:8080
+# A template is 128 little-endian float32 values, unit length, base64 (684 chars). Example: unit vector e0
+T=$(python3 -c "import base64,struct;print(base64.b64encode(struct.pack('<128f',1.0,*[0.0]*127)).decode())")
+
+# Enrol (scope enroll) -> 201 {"subjectId":"s1","version":1}; enrolling again creates version 2
+curl -X POST $B/v1/subjects/s1/enrollment -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+     -d "{\"template\":\"$T\"}"
+
+# Verify (scope verify) -> 202 {"verificationId":"…","status":"PENDING"} + Location
+# Same Idempotency-Key + same body within 24 h returns the same id (202/200); a different body gets 422
+curl -X POST $B/v1/verifications -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+     -H 'Idempotency-Key: req-0001' -d "{\"subjectId\":\"s1\",\"probeTemplate\":\"$T\"}"
+
+# Read the result (scope verify) -> {"verificationId":"…","subjectId":"s1","status":"MATCH","score":1.0,"threshold":0.5,"decidedAt":"…"}
+# status: PENDING | MATCH | NO_MATCH | FAILED (+ "reason": SUBJECT_NOT_ENROLLED | SUBJECT_ERASED | MAX_ATTEMPTS)
+curl $B/v1/verifications/<verificationId> -H "Authorization: Bearer $TOKEN"
+
+# Tenant decision threshold (scope admin, 0.0–1.0, default 0.5) -> 200 {"threshold":0.7}
+curl -X PUT $B/v1/tenant/threshold -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"threshold":0.7}'
+
+# Right to erasure (scope admin) -> 204; unknown or another tenant's subject -> 404; malformed id -> 400
+curl -X DELETE $B/v1/subjects/s1 -H "Authorization: Bearer $TOKEN"
+```
+
+Status codes: 400 invalid input, 401 missing/invalid token (`WWW-Authenticate: Bearer`), 403 missing scope, 404 unknown or
+other tenant's resource, 413 body > 8 KB, 415 not JSON, 422 idempotency key reused with a different body. Full contract:
+[docs/SPEC.md](docs/SPEC.md) and the API table in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+## Configuration
+
+Everything is set in `compose.yaml`; secrets and keys are generated on first start (never in git). Environment variables:
+
+| Variable | App | Default | Meaning |
+|---|---|---|---|
+| `DB_URL`, `DB_USER` | gateway, matcher | `jdbc:postgresql://localhost:5432/matchgw`, `matchgw` | Database |
+| `DB_PASSWORD` | gateway, matcher | – | Read from the generated `dbcreds` volume (Spring configtree) |
+| `RABBITMQ_HOST`, `RABBITMQ_USER` | gateway, matcher | `localhost`, `matchgw` | Broker (port 5672) |
+| `RABBITMQ_PASSWORD` | gateway, matcher | – | Read from the generated `mqcreds` volume |
+| `JWT_PUBLIC_KEY_LOCATION` | gateway | `file:/run/keys/jwt-public.pem` | RS256 public key (written by `keygen`) |
+| `JWT_ISSUER`, `JWT_AUDIENCE` | gateway, devtoken | `https://match-gateway.invalid/dev-issuer`, `match-gateway` | Required `iss` / `aud` |
+| `IDEMPOTENCY_HMAC_KEY_LOCATION` | gateway | `file:/run/keys/idempotency-hmac.key` | 32-byte HMAC key for idempotency fingerprints |
+
+Tuning properties (Spring relaxed binding, e.g. `MATCHER_PROCESSING_DEADLINE=15s`): `matcher.processing-deadline` (10 s,
+≤ 30 s), `matcher.dead-letter-retry-delay` (1 s), `matcher.queue-depth-refresh` (5 s), `app.outbox.relay-age` (15 s),
+`app.outbox.relay-interval` (1 s), `app.outbox.confirm-timeout` (5 s). Ports: gateway 8080 on 127.0.0.1 only; matcher actuator
+(health, prometheus) 8081 inside the compose network only; Postgres and RabbitMQ are not published.
+
+## Architecture and decisions
+
+- `gateway` (REST API, JWT resource server, Flyway owner) writes each verification and an outbox row in one transaction and
+  publishes the verification id to a RabbitMQ quorum queue; `matcher` ×3 consume it, decide (cosine vs the tenant threshold)
+  and write the outcome with a guarded update, so it is decided exactly once. Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+- Decisions: [docs/analysis/DECISIONS.md](docs/analysis/DECISIONS.md); ADRs in [docs/adr/](docs/adr/) – notably
+  ADR-009 (RabbitMQ + transactional outbox, supersedes ADR-003), ADR-004 (dev tokens), ADR-007 (erasure), ADR-008 (idempotency).
+
+## Security notes
+
+- JWT only (RS256 pinned, `iss`/`aud`/`exp`/`nbf` validated, TTL ≤ 15 min, `tenant_id` required); scopes enforced per URL before
+  the body is read; tenant isolation in every SQL statement (other tenants' resources → 404).
+- Biometric data minimisation: the probe is deleted when a verification is decided; erasure removes templates, probes and
+  fingerprints; idempotency stores only an HMAC; broker messages carry only the verification id; logs contain no templates or tokens.
+- Hardened containers (non-root, read-only, no capabilities), generated credentials, no published DB/broker ports.
+- Threat model and OWASP matrix: [docs/SECURITY.md](docs/SECURITY.md) and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §5;
+  residual risks under "Known limitations" below. ZAP has not been run.
+
+## AI usage
+
+Built with Claude Code under a governed workflow (CLAUDE.md rulebook, hooks, test-first subagents, code and security reviewers).
+Every step, review finding and human decision is logged in [docs/AI_LOG.md](docs/AI_LOG.md).
+
 ## Load test and evaluation (AC-53..AC-58)
 
 Measured 2026-10-12 on an Apple M3 Pro (12 cores, 36 GiB RAM), macOS 26.6.2, Docker Desktop 29.8.0 (VM: 12 CPUs, 7.65 GiB).
